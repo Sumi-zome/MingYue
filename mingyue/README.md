@@ -9,7 +9,8 @@ mingyue/
 ├─ scripts/
 │  ├─ export.sh      导出加密包（备份 = 迁移包）
 │  ├─ restore.sh     在新主机上恢复
-│  └─ bootstrap.sh   新主机装依赖 + 自启（平台差异只在这里）
+│  ├─ bootstrap.sh   新主机装依赖 + 自启（平台差异只在这里）
+│  └─ status.sh      状态自检：sshd / 引擎 / 端口 / 家里 / 备份
 └─ schedules/
    └─ SETUP.md       迁移后重建定时任务的提示词
 ```
