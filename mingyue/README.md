@@ -7,6 +7,9 @@
 ```
 mingyue/
 ├─ scripts/
+│  ├─ mem.py         记忆库读写（init/add-episode/consolidate/search/pin/render/forget/report/rebuild/check）
+│  ├─ schema.sql     记忆库表结构（mem.py init 逐条执行）
+│  ├─ selftest.py    mem.py 自查：python3 selftest.py（退出码 0 = 全过）
 │  ├─ export.sh      导出加密包（备份 = 迁移包）
 │  ├─ restore.sh     在新主机上恢复
 │  ├─ bootstrap.sh   新主机装依赖 + 自启（平台差异只在这里）
@@ -14,6 +17,9 @@ mingyue/
 └─ schedules/
    └─ SETUP.md       迁移后重建定时任务的提示词
 ```
+
+> 运行期数据（`memory.db`、`journal.jsonl`、`AGENTS.md`）不进仓库，留在主机上。
+> 备份包里 `journal.jsonl` 是审计真源：删了 `memory.db` 就靠它 `mem.py rebuild --from` 重建。
 
 ## 一次性准备：age 密钥对
 

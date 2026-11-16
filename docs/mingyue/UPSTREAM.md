@@ -146,8 +146,10 @@ git commit              # merge 会自己带 message
 | `fatal: not a git repository` | 不在仓库目录 | `cd D:\MingYue` |
 | `unrecognized argument: --online` | 拼错 | 是 `--oneline` |
 | `schannel: server closed abruptly` | HTTPS 连 GitHub 被掐 | 改 SSH 远端，或 `git config --local http.proxy http://127.0.0.1:7890` |
+| `Connection closed by UNKNOWN port 65535` + `CreateProcessW failed` | **不是网络**：`~/.ssh/config` 里 `ProxyCommand`（如 `connect`）程序不在 PATH | `ssh -T git@github.com` 确认；注释掉 ProxyCommand，或改用 `ssh.github.com:443` |
+| `Could not read from remote repository` | 先分清网络还是本地 | 跑 `ssh -T git@github.com`：成功后失败 = 本地工具问题；失败 = 网络/认证问题 |
 | `! [rejected] ... non-fast-forward` | 远端有你本地没有的提交 | `git pull --rebase origin main` 后再推 |
-| 终端出现 `>>` | 命令没写完（多行粘贴） | 一行一行粘，或按 Ctrl+C 重来 |
+| 终端出现 `>>` | 命令没写完（多行粘贴，PS 5.1 不支持带格式粘贴） | 一行一行粘，或用 `;` 连接，或 Ctrl+C 重来 |
 
 ---
 

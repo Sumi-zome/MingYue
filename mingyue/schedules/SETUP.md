@@ -10,9 +10,27 @@
 请按以下规格用 schedule_create 建三条自动化任务，一次建一条，建完告诉我结果：
 
 1) 每天 23:40 —— 记忆抽取
-   提示词：读今天的会话，输出 JSONL（type/text/importance/when），
-   只写对方明确说过或你亲眼看到的事，不确定的不要写。
-   产出写到 /tmp/mingyue-extract.jsonl。
+   提示词：
+   读今天的会话，输出 JSONL 到 /tmp/mingyue-extract.jsonl，一行一条候选。
+   顺序很重要：先输出 episode，再输出引用它的 fact / intention。
+
+   episode 行（id / at / text / source 四个必填）：
+   {"type":"episode","id":"e-20261116-01","at":"2026-11-16T21:00:00+08:00",
+    "kind":"chat","text":"对方聊到宿舍晚上断电","source":"session:<会话id>","importance":0.5}
+
+   fact 行（source_episode 必须指向上面某个 episode 的 id）：
+   {"type":"fact","text":"对方宿舍晚上断电","source_episode":"e-20261116-01",
+    "when":"2026-11-16","importance":0.6}
+
+   intention 行（同样要 source_episode）：
+   {"type":"intention","text":"问他毕业设计选了哪个题目",
+    "source_episode":"e-20261116-01","due":"2026-11-17"}
+
+   规则：
+   - 一次最多 3 条 episode、5 条 fact、2 条 intention；宁少勿多。
+   - 只写对方明确说过或你亲眼看到的事；不确定的不要写。
+   - id 用 e-YYYYMMDD-NN 格式，同一天内不重复。
+   - 任何一行字段不全，整批都会被拒绝（consolidate 会报行号），所以宁可少写。
 
 2) 每天 23:50 —— 沉淀落库
    提示词：运行 python3 ~/mingyue/scripts/mem.py consolidate --day 今天

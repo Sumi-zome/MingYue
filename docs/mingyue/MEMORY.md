@@ -41,7 +41,7 @@
 
 ## 2. 数据模型（SQLite）
 
-单文件 `~/mingyue/memory.db`。Termux 的 Python 自带 `sqlite3`，零安装。
+单文件 `~/mingyue/memory.db`，加上同目录只追加的 `journal.jsonl`（审计真源）。Termux 的 Python 自带 `sqlite3`，零安装。
 
 ```sql
 -- 情景：发生了什么
@@ -51,7 +51,9 @@ CREATE TABLE episodes (
   kind        TEXT NOT NULL,             -- chat | reading | event
   text        TEXT NOT NULL,             -- 一行事实陈述
   importance  REAL NOT NULL DEFAULT 0.5, -- 0..1，抽取时给
-  source      TEXT NOT NULL              -- 会话 id / 文件路径
+  source      TEXT NOT NULL,             -- 会话 id / 文件路径
+  archived_at TEXT,                      -- 非空 = 已归档（§4.2）；不搬表、不删行
+  last_used   TEXT                       -- 上次被再次提到/采用的时间（§3.2 NOOP、§4.2 衰减）
 );
 
 -- 语义：什么是真的（带时序）
@@ -63,7 +65,9 @@ CREATE TABLE facts (
   confidence     REAL NOT NULL DEFAULT 0.7,
   importance     REAL NOT NULL DEFAULT 0.5,
   source_episode TEXT NOT NULL REFERENCES episodes(id),
-  superseded_by  TEXT REFERENCES facts(id)
+  superseded_by  TEXT REFERENCES facts(id),
+  archived_at    TEXT,                   -- 非空 = 已归档；检索默认不含，可被召回
+  last_used      TEXT                    -- 上次被再次提到/采用的时间
 );
 
 -- 前瞻：以后要提起的事
@@ -83,13 +87,14 @@ CREATE TABLE core (
   updated_at TEXT NOT NULL
 );
 
--- 审计：只追加，永不改
+-- 审计：库内这张表是**派生视图**，真源是家目录的 journal.jsonl
+-- （每行一条，先 fsync 文件再提交库）。删库后 rebuild 只从那个文件重放。
 CREATE TABLE journal (
   seq    INTEGER PRIMARY KEY AUTOINCREMENT,
   at     TEXT NOT NULL,
-  op     TEXT NOT NULL,                  -- add|update|supersede|archive|pin|forget|rebuild
+  op     TEXT NOT NULL,                  -- add|update|supersede|noop|pin|forget|adopt|rebuild
   target TEXT NOT NULL,
-  before TEXT,
+  before TEXT,                           -- 整行 JSON 信封，重放只依赖它
   after  TEXT,
   reason TEXT NOT NULL,
   source TEXT NOT NULL
@@ -97,15 +102,17 @@ CREATE TABLE journal (
 
 -- 检索：SQLite 全文索引。
 -- ⚠️ 中文必须用 trigram 分词器：默认 unicode61 不切中文，整句会被当成一个词，检索基本失效。
+-- ⚠️ trigram 的短词限制：查询词 <3 字产生不了 token（「宿舍」搜不到任何东西），
+--    mem.py 对这类词改用 LIKE 兜底；≥3 字的词才走 MATCH。见 §5.2。
 CREATE VIRTUAL TABLE mem_fts USING fts5(text, ref UNINDEXED, kind UNINDEXED, tokenize='trigram');
 ```
 
 **硬约束（写进脚本，不是靠自觉）**
 
 1. `facts.source_episode` 必填，且必须存在 → **没有出处的记忆写不进去**。
-2. `facts` 不物理删除：改则由 `superseded_by` 指向新条目，`valid_to` 打上时间。
+2. `facts` / `episodes` 不物理删除：改则 `superseded_by` 指向新条目 + `valid_to` 打时间；遗忘则打 `archived_at`。
 3. 每次写入必须带 `reason`（"对方明确说了" / "从日记第 2 条提升"）→ 进 `journal`。
-4. `core` 三个块合计 ≤ 1200 字，超了按 `importance` 淘汰到 `archive`。
+4. `core` 所有块合计 ≤ 1200 字；超了 `pin` **报错**，不静默截断、也不自动淘汰（淘汰哪条是人的判断，不该由脚本猜）。
 
 ---
 
@@ -164,8 +171,10 @@ CREATE VIRTUAL TABLE mem_fts USING fts5(text, ref UNINDEXED, kind UNINDEXED, tok
 strength = importance × exp(-days_since_last_used / τ)      τ = 30 天
 ```
 
-- `strength < 0.15` → 进 `archive`（**不删**，可被检索召回）
-- `last_used` 在每次检索命中时更新
+- `strength < 0.15` → 打上 `archived_at`（**不删、不搬表**，仍可被检索召回）
+- **归档 = `archived_at` 非空**：默认检索不含；`search --include-archived` 可召回；
+  显式命中后 `--adopt` 复活（清 `archived_at`、刷新 `last_used`）
+- `last_used` 在条目被再次提到（NOOP / UPDATE）或被采用（adopt）时刷新；**检索本身只读，不写库**
 - `core` 里的条目永不衰减
 
 这是艾宾浩斯遗忘曲线的粗糙版；目的不是"忘掉"，是**别让 prompt 被陈年旧账塞满**。
@@ -204,12 +213,17 @@ DSH 会把工作区的 `AGENTS.md` 自动注入上下文。所以每晚脚本重
 
 用 marker 划分，脚本只替换两个 marker 之间的内容。**这就是 MemGPT 的 core memory，落到 AGENTS.md 上，不需要改引擎。**
 
+渲染由 `mem.py render` 做：原子写（临时文件 + `os.replace`，绝不半写；这文件会被注入每个会话）、
+只替换两个 marker 之间、**marker 外逐字节保留**、marker 缺失直接报错且不动原文件、
+块顺序固定 self → user → relationship → care → tone → narrative、同一份数据渲染两次字节完全相同。
+定时任务只负责**什么时候调** render，不负责拼内容。
+
 ### 5.2 按需检索（工具）
 
 给她的工具（一个 Python 子命令）：
 
 ```
-python3 mem.py search "宿舍 断电" --k 8
+python3 ~/mingyue/scripts/mem.py search "宿舍 断电" --k 8
 ```
 
 返回按分数排序的条目，每条带时间、类型、id：
@@ -225,6 +239,16 @@ python3 mem.py search "宿舍 断电" --k 8
 score = 0.45 × 相关性(FTS) + 0.30 × 重要度 + 0.25 × 新鲜度
 新鲜度 = exp(-距离今天的天数 / 14)
 ```
+
+**实现口径**（和上面公式的差别，别当成同一件事）：
+
+- **相关性不是 bm25**：实测在小库上 bm25 返回 ~1e-6 的噪音，不可用。实现用可解释的两个分量：
+  `相关性 = 0.5 × 词覆盖率 + 0.5 × 整串命中`。
+- **≥3 字的词走 FTS MATCH，<3 字走 LIKE**：trigram 把文本切成 3 字滑窗，
+  「宿舍」这种 2 字词产生不了 token，纯 FTS 一条都搜不到（2026-11-16 实测）。
+  `search "宿舍 断电"` 能命中，靠的是 LIKE 兜底。
+- **检索只读**：不改 `last_used`、不写库；默认只返回活跃条目，
+  `--include-archived` / `--include-superseded` 才放开。
 
 **这套检索的已知弱点**（别自欺）：FTS 是字面匹配，"宿舍断电"搜不到"晚上没电"。同义改写、指代、跨语言都是盲区。缓解办法有两条，代价不同：
 
@@ -260,7 +284,7 @@ score = 0.45 × 相关性(FTS) + 0.30 × 重要度 + 0.25 × 新鲜度
 |---|---|---|
 | 1 | 没有出处不写 | `source_episode` 外键 + 必填 |
 | 2 | 每次写入有理由 | `journal.reason` 必填 |
-| 3 | 能重建 | `mem.py rebuild` 从 journal 重放 |
+| 3 | 能重建 | `mem.py rebuild --from journal.jsonl` 重放（库内 journal 表只是派生视图） |
 | 4 | 矛盾显式处理 | 只能 supersede，不能悄悄改 |
 | 5 | 有容量上限 | core ≤1200 字，检索 ≤8 条 |
 | 6 | 有遗忘 | 衰减 → 归档，归档不参与常驻注入 |
@@ -275,10 +299,13 @@ score = 0.45 × 相关性(FTS) + 0.30 × 重要度 + 0.25 × 新鲜度
 
 ```
 ~/mingyue/
-├─ memory.db
-├─ mem.py                  # 全部子命令，约 400 行
-├─ schema.sql
-├─ AGENTS.md               # CORE 块由脚本维护
+├─ memory.db               # 记忆库（SQLite）
+├─ journal.jsonl           # 审计真源，只追加；库内 journal 表是它的派生视图
+├─ scripts/
+│  ├─ mem.py               # 全部子命令
+│  ├─ schema.sql
+│  └─ selftest.py          # 自查：python3 scripts/selftest.py
+├─ AGENTS.md               # CORE 块由 mem.py render 维护
 ├─ persona.md              # 手工
 ├─ rules.md                # 手工：说话规则、检索规则
 ├─ skills/content/         # 内容理解（PLAN §6.5）
@@ -288,24 +315,28 @@ score = 0.45 × 相关性(FTS) + 0.30 × 重要度 + 0.25 × 新鲜度
 
 ### 7.2 `mem.py` 子命令
 
-| 命令 | 作用 |
-|---|---|
-| `extract --day DATE` | 输出当天对话给模型抽取（或校验模型给的 JSONL） |
-| `consolidate --day DATE --jsonl FILE` | 归并 + 落库 + 重建 FTS + 写 journal |
-| `search "query" --k 8` | 检索，返回带分数的条目 |
-| `pin BLOCK "text"` | 手动写核心记忆块 |
-| `import-profile me.md` | 把初始档案灌进 `facts`（`source=me.md`，可重复执行、幂等） |
-| `forget ID --reason "…"` | 归档一条（不删） |
-| `report --week` | 周报文本 |
-| `rebuild --check` | 从 journal 重放校验 |
-| `export --md` | 导出 daily/*.md 给人看 |
+| 命令 | 作用 | 状态 |
+|---|---|---|
+| `init` | 建库、建表、建 FTS（幂等；没有 FTS5 时退化并说明） | 已有 |
+| `add-episode --kind --text --source --reason` | 写一条情景，校验必填字段 | 已有 |
+| `consolidate --jsonl FILE [--day D] [--reason R]` | 全量校验 → ADD/UPDATE/SUPERSEDE/NOOP → 落库 → 重建 FTS → 写 journal | 已有 |
+| `search "query" --k 8 [--json] [--include-archived] [--include-superseded] [--adopt ID --reason R]` | 检索，返回带分数的条目 | 已有 |
+| `pin BLOCK "text" --reason R` | 写核心记忆块（所有块合计 ≤1200 字，超了报错不截断） | 已有 |
+| `render [--check]` | 把 core 渲染进 `AGENTS.md` 的 marker 之间（原子写） | 已有 |
+| `forget ID --reason R` | 归档一条（不物理删除） | 已有 |
+| `check` | 自检：表 / FTS trigram / 外键 / core 字数 / 审计文件 | 已有 |
+| `rebuild --from journal.jsonl` | 删库后从审计链重建 | 已有 |
+| `rebuild --check` | 重放校验，输出差异清单 | 已有 |
+| `extract --day DATE` | 输出当天对话给模型抽取（或校验模型给的 JSONL） | 下一窗口 |
+| `import-profile me.md` | 把初始档案灌进 `facts`（`source=me.md`，可重复执行、幂等） | 下一窗口 |
+| `export --md` | 导出 daily/*.md 给人看 | 下一窗口 |
 
 ### 7.3 三个自动化任务
 
 | 任务 | 时间 | 提示词要点 |
 |---|---|---|
 | 抽取 | 23:40 | "读今天的会话，按 schema 输出 JSONL，宁可少写；不确定的不要写" |
-| 沉淀 | 23:50 | "运行 `mem.py consolidate --day 今天 --jsonl /tmp/today.jsonl`，失败就报告错误，不要改数据" |
+| 沉淀 | 23:50 | "运行 `mem.py consolidate --day 今天 --jsonl /tmp/today.jsonl --reason 日整理`，失败就报告错误，不要改数据" |
 | 周反思 | 周日 22:00 | "读最近 7 天 episodes 与 facts，提出矛盾/重复/失效三类提案，交脚本执行" |
 
 > 注意：**模型的输出必须过脚本校验**。`consolidate` 遇到不合法的行整行拒绝并回显原因，不静默吞。
@@ -320,7 +351,7 @@ score = 0.45 × 相关性(FTS) + 0.30 × 重要度 + 0.25 × 新鲜度
 4. 连续 30 天不用的条目进了归档，检索仍能召回。
 5. `AGENTS.md` 的 CORE 块不超过 1200 字，且每天自动更新。
 6. 手工区的内容在自动重写后仍然存在。
-7. 把 `memory.db` 删掉，`mem.py rebuild` 能从 `journal` 重建出等价的库。
+7. 把 `memory.db` 删掉，`mem.py rebuild --from journal.jsonl` 能从审计链重建出等价的库；再跑 `rebuild --check` 报告无差异。
 8. 周报能说明"这周新增 5 条、合并 2 条、归档 3 条"。
 9. 她的回答里引用记忆时，不带编号、不带"根据我的记忆库"这种机器话。
 10. 故意喂一条错误的 JSONL，`consolidate` 拒绝并给出可读原因，数据库不变。
