@@ -11,30 +11,32 @@
 
 1) 每天 23:40 —— 记忆抽取
    提示词：
-   读今天的会话，输出 JSONL 到 /tmp/mingyue-extract.jsonl，一行一条候选。
-   顺序很重要：先输出 episode，再输出引用它的 fact / intention。
+   读今天的会话，输出 JSONL 到 ~/mingyue/tmp/mingyue-extract.jsonl，一行一条候选。
+   顺序很重要：先输出 episode，再输出引用它的 fact / intention。每一行都必须带 reason。
 
-   episode 行（id / at / text / source 四个必填）：
+   episode 行（id / at / text / source / reason 五个必填）：
    {"type":"episode","id":"e-20261116-01","at":"2026-11-16T21:00:00+08:00",
-    "kind":"chat","text":"对方聊到宿舍晚上断电","source":"session:<会话id>","importance":0.5}
+    "kind":"chat","text":"对方聊到宿舍晚上断电","source":"session:<会话id>",
+    "importance":0.5,"reason":"对方明确说了"}
 
-   fact 行（source_episode 必须指向上面某个 episode 的 id）：
+   fact 行（source_episode 必须指向上面某个 episode 的 id，reason 必填）：
    {"type":"fact","text":"对方宿舍晚上断电","source_episode":"e-20261116-01",
-    "when":"2026-11-16","importance":0.6}
+    "when":"2026-11-16","importance":0.6,"reason":"对方明确说了"}
 
-   intention 行（同样要 source_episode）：
+   intention 行（同样要 source_episode 和 reason）：
    {"type":"intention","text":"问他毕业设计选了哪个题目",
-    "source_episode":"e-20261116-01","due":"2026-11-17"}
+    "source_episode":"e-20261116-01","due":"2026-11-17","reason":"他说还没定"}
 
    规则：
    - 一次最多 3 条 episode、5 条 fact、2 条 intention；宁少勿多。
    - 只写对方明确说过或你亲眼看到的事；不确定的不要写。
    - id 用 e-YYYYMMDD-NN 格式，同一天内不重复。
+   - 每一行都必须有 reason，写清"依据是什么"（对方原话 / 你看到的事实）。
    - 任何一行字段不全，整批都会被拒绝（consolidate 会报行号），所以宁可少写。
 
 2) 每天 23:50 —— 沉淀落库
    提示词：运行 python3 ~/mingyue/scripts/mem.py consolidate --day 今天
-   --jsonl /tmp/mingyue-extract.jsonl；失败就报告错误，不要改数据，不要自己编。
+   --jsonl ~/mingyue/tmp/mingyue-extract.jsonl；失败就报告错误，不要改数据，不要自己编。
 
 3) 每周日 22:00 —— 周反思
    提示词：读最近 7 天的 episodes 与 facts，提出「矛盾 / 重复 / 失效」三类提案，

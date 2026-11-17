@@ -49,7 +49,7 @@ if ! command -v dsh >/dev/null; then
 fi
 
 # 目录
-mkdir -p "$HOME_DIR"/{scripts,schedules,reads,daily}
+mkdir -p "$HOME_DIR"/{scripts,schedules,reads,daily,tmp}
 
 # 自启
 if [ "$MODE" = "termux" ]; then

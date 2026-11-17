@@ -64,6 +64,7 @@ trap 'rm -rf "$STAGE"' EXIT
 # 打包：排除 SQLite 的 wal/shm 与原始语料归档
 tar -C "$(dirname "$MINGYUE_HOME")" \
     --exclude="$(basename "$MINGYUE_HOME")/archive" \
+    --exclude="$(basename "$MINGYUE_HOME")/tmp" \
     --exclude='*.db-wal' --exclude='*.db-shm' \
     -cf - "$(basename "$MINGYUE_HOME")" | zstd -19 -T0 -q -o "$STAGE/$BASE"
 

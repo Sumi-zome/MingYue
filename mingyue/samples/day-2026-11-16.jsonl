@@ -1,0 +1,4 @@
+{"type":"episode","id":"e-20261116-01","at":"2026-11-16T21:00:00+08:00","kind":"chat","text":"对方聊到宿舍晚上断电，说打算用旧手机当服务器","source":"session:manual-test","importance":0.6,"reason":"对方明确说了"}
+{"type":"fact","text":"对方宿舍晚上断电","source_episode":"e-20261116-01","when":"2026-11-16","importance":0.6,"reason":"对方明确说了"}
+{"type":"fact","text":"对方在做一个叫溟月的 App","source_episode":"e-20261116-01","when":"2026-11-16","importance":0.7,"reason":"对方明确说了"}
+{"type":"intention","text":"问他旧手机够不够用","source_episode":"e-20261116-01","due":"2026-11-17","reason":"他说还没定，明天可以问"}

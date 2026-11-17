@@ -122,15 +122,25 @@ CREATE VIRTUAL TABLE mem_fts USING fts5(text, ref UNINDEXED, kind UNINDEXED, tok
 
 ### 3.1 抽取（模型）
 
-提示词让它读今天的会话 + 今天的 `reads/` 摘要，输出 **JSON Lines**，每条：
+提示词让它读今天的会话 + 今天的 `reads/` 摘要，输出 **JSON Lines**。**顺序必须是先 episode、后 fact/intention**（后者要引用前者的 id）：
 
 ```json
-{"type":"fact","text":"对方宿舍晚上断电","importance":0.6,"when":"2026-11-16","about":"user"}
-{"type":"episode","text":"聊了毕业设计的事，他有点焦虑","importance":0.4}
-{"type":"intention","text":"问他毕业设计选了哪个题目","due":"2026-11-17"}
+{"type":"episode","id":"e-20261116-01","at":"2026-11-16T21:00:00+08:00","kind":"chat","text":"对方聊到宿舍晚上断电","source":"session:<会话id>","importance":0.5,"reason":"对方明确说了"}
+{"type":"fact","text":"对方宿舍晚上断电","source_episode":"e-20261116-01","when":"2026-11-16","importance":0.6,"reason":"对方明确说了"}
+{"type":"intention","text":"问他毕业设计选了哪个题目","source_episode":"e-20261116-01","due":"2026-11-17","reason":"他说还没定"}
 ```
 
-要求：宁可少提，不许推测；只写"对方明确说过"或"你亲眼看到"的。
+**必填字段**（缺一个整批被拒，`mem.py` 会报行号）：
+
+| type | 必填 |
+|---|---|
+| `episode` | `id` `at` `kind` `text` `source` `reason` |
+| `fact` | `text` `source_episode` `reason`（`when` 可省，默认当天） |
+| `intention` | `text` `source_episode` `reason`（`due` 可省） |
+
+要求：宁可少提，不许推测；只写"对方明确说过"或"你亲眼看到"的。`reason` 写依据，不写复述。
+
+> 可运行的样例见 `mingyue/samples/day-2026-11-16.jsonl`，改之前先拿它跑一遍 `consolidate`。
 
 ### 3.2 归并（脚本，决定性逻辑）
 
