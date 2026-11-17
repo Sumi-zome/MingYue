@@ -50,3 +50,12 @@ fi
 echo
 echo "== 备份 =="
 ls -1t "$HOME"/backups/mingyue-* 2>/dev/null | head -3 || echo "还没有备份"
+
+echo
+echo "== Termux 兼容补丁（附件/图片能不能用）=="
+HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+if [ -f "$HERE/fix-termux.sh" ]; then
+  bash "$HERE/fix-termux.sh" --check 2>&1 | sed 's/^/  /'
+else
+  echo "  找不到 fix-termux.sh（补丁脚本没同步过来？）"
+fi

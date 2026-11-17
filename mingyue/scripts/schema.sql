@@ -1,7 +1,9 @@
--- 溟月 · 记忆库 schema v1（基线 = docs/mingyue/MEMORY.md §1–§8）
+-- 溟月 · 记忆库 schema v2（基线 = docs/mingyue/MEMORY.md §1–§8）
 --
 -- 由 `mem.py init` 逐条语句执行。不要手工 `sqlite3 memory.db < schema.sql`：
 -- FTS5 或 trigram 不可用时 init 会跳过 mem_fts 并退化成 LIKE 检索。
+-- 版本头是 `PRAGMA user_version`（当前 2），由 mem.py 读写；老库由 init 原地 ALTER 迁移：
+--   v1 → v2 : core.origin + journal.v
 --
 -- 字符数口径 = SQLite length()，即 Unicode 码点；一个汉字算 1 字。
 --
@@ -10,7 +12,7 @@
 --                   / *.archived_at / *.last_used      例：2026-11-16T21:04:24+08:00
 --   纯日期          facts.valid_from / facts.valid_to  例：2026-11-16
 --
--- 与 MEMORY.md §2 的差异只有 4 个补列（原表结构缺了文档自己引用的载体），
+-- 与 MEMORY.md §2 的差异只有 4 个补列（原表结构缺了文档自己引用的载体）+ schema v2 两列，
 -- 每列下面都注了出处；其余逐字照 §2。
 
 PRAGMA foreign_keys = ON;
@@ -56,16 +58,21 @@ CREATE TABLE IF NOT EXISTS intentions (
 );
 
 -- 核心：常驻上下文的那几百字（三块合计 ≤ 1200 字，由 mem.py 强制，超了报错不截断）
+-- block：self | user | relationship（pin 写，origin=manual）
+--        auto（core-refresh 写，origin=auto，≤600 字，manual 优先占额度）
+-- origin：schema v2。manual = 人写的，脚本永不自动覆盖；auto = 脚本块
 CREATE TABLE IF NOT EXISTS core (
   block      TEXT PRIMARY KEY,
   text       TEXT NOT NULL,
-  updated_at TEXT NOT NULL
+  updated_at TEXT NOT NULL,
+  origin     TEXT NOT NULL DEFAULT 'manual'
 );
 
 -- 审计：库内这张表是**派生视图**，真源是家目录里的 journal.jsonl
 -- （每行一条记录，先 fsync 该文件再提交数据库；rebuild 只从它重放）。
--- op 取值：add | update | supersede | noop | pin | forget | adopt | rebuild
+-- op 取值：add | update | supersede | noop | pin | forget | adopt | rebuild | refresh | archive
 -- before/after 存整行 JSON 信封（{"table":…,"row":…}），重放只依赖它，不再查别的。
+-- v：schema v2。审计记录版本，缺省按 1 处理（见 docs/mingyue/MIGRATION.md §8.1）
 CREATE TABLE IF NOT EXISTS journal (
   seq    INTEGER PRIMARY KEY AUTOINCREMENT,
   at     TEXT NOT NULL,
@@ -74,7 +81,8 @@ CREATE TABLE IF NOT EXISTS journal (
   before TEXT,
   after  TEXT,
   reason TEXT NOT NULL,
-  source TEXT NOT NULL
+  source TEXT NOT NULL,
+  v      INTEGER NOT NULL DEFAULT 1
 );
 
 CREATE INDEX IF NOT EXISTS idx_episodes_at      ON episodes(at);

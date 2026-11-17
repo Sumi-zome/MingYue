@@ -29,7 +29,9 @@ import json
 import math
 import os
 import re
+import shutil
 import sqlite3
+import subprocess
 import sys
 import tempfile
 import unicodedata
@@ -42,11 +44,12 @@ EXIT_STATE = 4
 
 CORE_LIMIT = 1200
 PIN_BLOCKS = ("self", "user", "relationship")
-RENDER_ORDER = ("self", "user", "relationship", "care", "tone", "narrative")
+RENDER_ORDER = ("self", "user", "relationship", "auto", "care", "tone", "narrative")
 RENDER_HEADINGS = {
     "self": "## 关于你",
     "user": "## 关于对方",
     "relationship": "## 我们之间",
+    "auto": "## 最近",
     "care": "## 此刻在意",
     "tone": "## 此刻的语气",
     "narrative": "## 我们的事",
@@ -65,13 +68,44 @@ MARK_BEGIN_LINE = "<!-- MINGYUE:CORE:BEGIN （脚本维护，勿手改） -->"
 MANUAL_HINT = "<!-- 手工区：以下内容脚本不动 -->"
 SIDECAR_NAME = "journal.jsonl"
 
+# ingest：磁盘会话 → 当天纯文本（口径见 docs/mingyue/MEMORY.md §3.1）
+KNOWN_SESSION_VERSIONS = (4,)
+SESSION_FILENAME = "session.v4.jsonl.zstd"
+MEMORY_TASK_PRESETS = ("mingyue-memory",)   # 三条记忆任务的会话预设名（双保险排除）
+INGEST_MAX_CHARS = 60000
+
+# schema / 审计版本头（docs/mingyue/MIGRATION.md §8.1）
+SCHEMA_VERSION = 2
+KNOWN_JOURNAL_VERSIONS = (1,)
+JOURNAL_RECORD_VERSION = 1
+
+# core-refresh：自动块（docs/mingyue/MEMORY.md §3.3）
+AUTO_BLOCK = "auto"
+AUTO_BLOCK_LIMIT = 600
+AUTO_MAX_FACTS = 8
+AUTO_FACT_CHARS = 80
+AUTO_FRAMES = ("最近我记着这些：", "还有：", "另外：", "我也没忘：", "最后：")
+CORE_ORIGINS = ("manual", "auto")
+
+# decay：衰减归档（docs/mingyue/MEMORY.md §4.2）
+DECAY_TAU_DAYS = 30.0
+DECAY_THRESHOLD = 0.15
+DECAY_IMPORTANCE_GUARD = 0.8
+
+# import-profile：初始档案（docs/mingyue/PLAN.md §6.3）
+PROFILE_EPISODE_ID = "e-import-profile"
+PROFILE_SOURCE = "me.md"
+PROFILE_IMPORTANCE = 0.9
+PROFILE_CONFIDENCE = 0.9
+PROFILE_ITEM_RE = re.compile(r"^\s*[-*]\s+(.+?)\s*$")
+
 TABLE_COLS = {
     "episodes": ["id", "at", "kind", "text", "importance", "source", "archived_at", "last_used"],
     "facts": ["id", "text", "valid_from", "valid_to", "confidence", "importance",
               "source_episode", "superseded_by", "archived_at", "last_used"],
     "intentions": ["id", "text", "due_at", "status", "source_episode", "created_at"],
-    "core": ["block", "text", "updated_at"],
-    "journal": ["seq", "at", "op", "target", "before", "after", "reason", "source"],
+    "core": ["block", "text", "updated_at", "origin"],
+    "journal": ["seq", "at", "op", "target", "before", "after", "reason", "source", "v"],
 }
 TABLE_PK = {"episodes": "id", "facts": "id", "intentions": "id", "core": "block", "journal": "seq"}
 KIND_TABLE = {"episode": "episodes", "fact": "facts", "intention": "intentions"}
@@ -134,12 +168,14 @@ def today():
 
 
 def resolve_day(raw):
-    """--day / when 的取值：today / 今天 / now / 日期 → 'YYYY-MM-DD'。"""
+    """--day / when 的取值：today / 今天 / now / yesterday / 昨天 / 日期 → 'YYYY-MM-DD'。"""
     if raw is None:
         return today().isoformat()
     s = str(raw).strip()
     if s in ("today", "now", "今天", "今日"):
         return today().isoformat()
+    if s in ("yesterday", "昨天", "昨日"):
+        return (today() - datetime.timedelta(days=1)).isoformat()
     return date_part(s)
 
 
@@ -231,13 +267,66 @@ def open_db(home):
     db = db_path(home)
     if not db.exists():
         raise MemError("找不到记忆库：%s（先运行 init，或 rebuild --from journal.jsonl）" % db, EXIT_STATE)
-    return connect(db)
+    con = connect(db)
+    stored = schema_version(con)
+    if stored != SCHEMA_VERSION:
+        con.close()
+        raise MemError(
+            "memory.db 是旧 schema（user_version=%s，当前脚本要 v%d）："
+            "先运行 python3 mem.py init 做幂等迁移（只 ALTER TABLE，不删数据），再重试。"
+            % (stored, SCHEMA_VERSION), EXIT_STATE)
+    return con
 
 
 def table_exists(con, name):
     return con.execute(
         "SELECT 1 FROM sqlite_master WHERE type='table' AND name=?", (name,)
     ).fetchone() is not None
+
+
+def schema_version(con):
+    return con.execute("PRAGMA user_version").fetchone()[0]
+
+
+def table_columns(con, table):
+    return [row["name"] for row in con.execute("PRAGMA table_info(%s)" % table)]
+
+
+def migrate_schema(con):
+    """把已有库按 user_version 原地升到 SCHEMA_VERSION；返回 (原版本, 现版本)。幂等、不重建。"""
+    stored = schema_version(con)
+    if stored > SCHEMA_VERSION:
+        raise MemError(
+            "memory.db 的 schema 版本是 %d，比本脚本认的 %d 新：不降级、不改动。"
+            "请换回新版本 mem.py，或从备份恢复。" % (stored, SCHEMA_VERSION), EXIT_STATE)
+    if stored == SCHEMA_VERSION:
+        missing = []
+        if "origin" not in table_columns(con, "core"):
+            missing.append("core.origin")
+        if "v" not in table_columns(con, "journal"):
+            missing.append("journal.v")
+        if missing:
+            raise MemError(
+                "memory.db 的 user_version 说已经是 v%d，但缺列：%s。"
+                "不要手补列；先备份，再按备份恢复或 rebuild。" % (SCHEMA_VERSION, "/".join(missing)),
+                EXIT_STATE)
+        return stored, stored
+    # 旧 init 从没写过 user_version（=0），按 v1 处理；本脚本只认 1→2
+    if stored not in (0, 1):
+        raise MemError("memory.db 的 schema 版本 %r 无法迁移（本脚本只认 1→2）。" % stored,
+                       EXIT_STATE)
+    # 显式事务：SQLite 的 DDL 在 Python sqlite3 里不一定自动开事务，这里手动 BEGIN
+    # 保证「两列 + 版本号」要么全成、要么全回滚（手机上迁移到一半断电也安全）。
+    try:
+        con.execute("BEGIN IMMEDIATE")
+        con.execute("ALTER TABLE core ADD COLUMN origin TEXT NOT NULL DEFAULT 'manual'")
+        con.execute("ALTER TABLE journal ADD COLUMN v INTEGER NOT NULL DEFAULT 1")
+        con.execute("PRAGMA user_version=%d" % SCHEMA_VERSION)
+        con.commit()
+    except BaseException:
+        con.rollback()
+        raise
+    return stored, SCHEMA_VERSION
 
 
 def has_fts(con):
@@ -366,12 +455,14 @@ def record_op(con, home, op, target, before, after, reason, source):
     rec = {
         "seq": seq, "at": now_iso(), "op": op, "target": str(target),
         "before": before, "after": after, "reason": str(reason), "source": source,
+        "v": JOURNAL_RECORD_VERSION,
     }
     append_sidecar(sidecar, rec)
     con.execute(
-        "INSERT INTO journal(seq, at, op, target, before, after, reason, source)"
-        " VALUES(?,?,?,?,?,?,?,?)",
-        (seq, rec["at"], op, rec["target"], dump(before), dump(after), rec["reason"], source),
+        "INSERT INTO journal(seq, at, op, target, before, after, reason, source, v)"
+        " VALUES(?,?,?,?,?,?,?,?,?)",
+        (seq, rec["at"], op, rec["target"], dump(before), dump(after), rec["reason"],
+         source, rec["v"]),
     )
     return seq
 
@@ -401,6 +492,14 @@ def read_sidecar(path):
                            EXIT_STATE)
         if not isinstance(rec["seq"], int):
             raise MemError("journal.jsonl 第 %d 行的 seq 不是整数" % idx, EXIT_STATE)
+        version = rec.get("v", JOURNAL_RECORD_VERSION)
+        if not isinstance(version, int) or version not in KNOWN_JOURNAL_VERSIONS:
+            raise MemError(
+                "journal.jsonl 第 %d 行是不认识的审计记录版本 v=%r（当前只认 %s；"
+                "没有 v 字段视为 1）。不要手改这一行，先备份文件再排查。"
+                % (idx, rec.get("v"),
+                   "/".join("%d" % v for v in KNOWN_JOURNAL_VERSIONS)), EXIT_STATE)
+        rec["v"] = version
         records.append(rec)
 
     seen = set()
@@ -441,10 +540,11 @@ def replay_records(con, records):
     for rec in records:
         upsert_apply(con, rec)
         con.execute(
-            "INSERT OR REPLACE INTO journal(seq, at, op, target, before, after, reason, source)"
-            " VALUES(?,?,?,?,?,?,?,?)",
+            "INSERT OR REPLACE INTO journal(seq, at, op, target, before, after, reason, source, v)"
+            " VALUES(?,?,?,?,?,?,?,?,?)",
             (rec["seq"], rec["at"], rec["op"], rec["target"],
-             dump(rec["before"]), dump(rec["after"]), rec["reason"], rec["source"]),
+             dump(rec["before"]), dump(rec["after"]), rec["reason"], rec["source"],
+             rec.get("v", JOURNAL_RECORD_VERSION)),
         )
 
 
@@ -778,6 +878,180 @@ def load_candidates(path):
     return items, errors, label
 
 
+# ── ingest：磁盘会话 → 当天纯文本 ───────────────────────────────────────────
+#
+# 口径（docs/mingyue/MEMORY.md §3.1）：只认 session.v4.jsonl.zstd；版本只看文件头；
+# 按 cwd（工作区）+ 事件 time（本地日期）过滤；只收真人 user/message 与 assistant/message
+# 的正文；tool/call、tool/result 压成一行工具名；没有真人消息的会话整段跳过。
+
+def sessions_root():
+    return Path(os.path.expanduser(os.path.join("~", ".dsh", "sessions")))
+
+
+def zstd_bin():
+    found = shutil.which("zstd")
+    if not found:
+        raise MemError(
+            "找不到 zstd：ingest 用 `zstd -dc` 解压会话文件（多帧由 zstd 自己拼）。"
+            "Termux 用 pkg install -y zstd；Debian/Ubuntu 用 apt install -y zstd；"
+            "Windows 把 zstd.exe 放进 PATH。", EXIT_STATE)
+    return found
+
+
+def read_session_lines(path):
+    """用 `zstd -dc` 解整个会话文件，返回解压后的行。文件是引擎整包原子替换的，不会读到半帧。"""
+    try:
+        proc = subprocess.Popen([zstd_bin(), "-dc", str(path)],
+                                stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+    except OSError as exc:
+        raise MemError("读不了会话文件：%s（%s）" % (path, exc), EXIT_STATE)
+    try:
+        out, err = proc.communicate()
+    except BaseException:
+        proc.kill()
+        proc.communicate()
+        raise
+    if proc.returncode != 0:
+        detail = err.decode("utf-8", "replace").strip().splitlines()
+        raise MemError("解压失败：%s（zstd 退出码 %d）%s" % (
+            path, proc.returncode,
+            ("：" + detail[-1][:300]) if detail else ""), EXIT_STATE)
+    try:
+        return out.decode("utf-8").splitlines()
+    except UnicodeDecodeError as exc:
+        raise MemError("会话文件不是 UTF-8：%s（%s）" % (path, exc), EXIT_STATE)
+
+
+def normalize_workspace(raw):
+    return os.path.normcase(os.path.abspath(os.path.expanduser(str(raw))))
+
+
+def default_workspace():
+    return normalize_workspace(os.path.join("~", "mingyue"))
+
+
+def workspace_of(header):
+    cwd = header.get("cwd")
+    if not isinstance(cwd, str) or not cwd.strip():
+        return None
+    return normalize_workspace(cwd)
+
+
+def parse_session_header(line, label):
+    """校验会话头：type=session、id 有值、版本只在已知集合里。"""
+    if not line.strip():
+        raise MemError("会话文件是空的：%s" % label, EXIT_STATE)
+    try:
+        header = json.loads(line)
+    except json.JSONDecodeError as exc:
+        raise MemError("会话文件第一行不是合法 JSON：%s（%s）" % (label, exc.msg), EXIT_STATE)
+    if not isinstance(header, dict) or header.get("type") != "session":
+        raise MemError("会话文件第一行不是会话头（type != session）：%s" % label, EXIT_STATE)
+    declared = [(key, header[key]) for key in ("version", "sessionFormatVersion")
+                if header.get(key) is not None]
+    if not declared:
+        raise MemError(
+            "会话头里没有 version / sessionFormatVersion，无法确认格式：%s" % label, EXIT_STATE)
+    unknown = [(key, value) for key, value in declared
+               if value not in KNOWN_SESSION_VERSIONS]
+    if unknown:
+        shown = "、".join("%s=%r" % pair for pair in unknown)
+        raise MemError(
+            "不认识的会话格式版本：%s（%s；当前只认 %s）。"
+            "不要把它当空数据跳过——先确认引擎版本或文件来源。" % (
+                shown, label, "/".join("v%d" % v for v in KNOWN_SESSION_VERSIONS)),
+            EXIT_STATE)
+    session_id = header.get("id")
+    if not isinstance(session_id, str) or not session_id.strip():
+        raise MemError("会话头里没有 id：%s" % label, EXIT_STATE)
+    return header
+
+
+def message_text(content):
+    """把 content parts 里的 text 拼成一行（reasoning / tool-call / image 都不要）。"""
+    if not isinstance(content, list):
+        return ""
+    texts = []
+    for part in content:
+        if not isinstance(part, dict) or part.get("type") != "text":
+            continue
+        value = part.get("text")
+        if isinstance(value, str) and value.strip():
+            texts.append(value)
+    return re.sub(r"\s+", " ", " ".join(texts)).strip()
+
+
+def extract_session(header, records, day, label):
+    """把一条会话的事件流折成当天要输出的行；当天没有真人消息 → None。"""
+    entries = []
+    human = 0
+    for record in records:
+        etype = record.get("type")
+        if etype not in ("user/message", "assistant/message", "tool/call"):
+            continue
+        raw_time = record.get("time")
+        try:
+            when = datetime.datetime.fromtimestamp(float(raw_time) / 1000.0)
+        except (TypeError, ValueError, OverflowError, OSError):
+            raise MemError("事件 time 不是合法毫秒时间戳（%s）：%r" % (label, raw_time),
+                           EXIT_STATE)
+        if when.date() != day:
+            continue
+        data = record.get("data")
+        data = data if isinstance(data, dict) else {}
+        if etype == "user/message":
+            source = data.get("source")
+            if not isinstance(source, dict) or source.get("kind") != "user":
+                continue      # 引擎注入的 user/message：自喂来源，不收
+            text = message_text(data.get("content"))
+            if not text:
+                continue
+            human += 1
+            entries.append((when, "对方", text))
+        elif etype == "assistant/message":
+            message = data.get("message")
+            text = message_text(message.get("content")) if isinstance(message, dict) else ""
+            if text:
+                entries.append((when, "溟月", text))
+        else:  # tool/call：一行工具名，不输出参数，tool/result 整条丢弃
+            name = data.get("name")
+            if isinstance(name, str) and name.strip():
+                entries.append((when, "工具", name.strip()))
+    if human == 0:
+        return None
+    return {"id": header["id"], "entries": entries, "human": human}
+
+
+def format_session(session):
+    lines = ["[会话 %s]" % session["id"]]
+    for when, role, text in session["entries"]:
+        lines.append("[%s] %s: %s" % (when.strftime("%H:%M"), role, text))
+    return lines
+
+
+def render_transcript(sessions, max_chars):
+    """返回 (文本, 省略字数|None)。保留开头，超限即停，末尾注明截断。"""
+    all_lines = []
+    for block_index, session in enumerate(sessions):
+        if block_index:
+            all_lines.append("")
+        all_lines.extend(format_session(session))
+    text = "\n".join(all_lines)
+    if len(text) <= max_chars:
+        return text, None
+    kept, used = [], 0
+    for line in all_lines:
+        extra = len(line) + (1 if kept else 0)
+        if used + extra > max_chars:
+            break
+        kept.append(line)
+        used += extra
+    kept_text = "\n".join(kept)
+    omitted = len(text) - len(kept_text)
+    note = "[截断] 超过上限 %d 字，后面的内容已省略（共省略 %d 字）。" % (max_chars, omitted)
+    return (kept_text + "\n" + note if kept_text else note), omitted
+
+
 # ── 子命令 ──────────────────────────────────────────────────────────────────
 
 def cmd_init(args):
@@ -786,20 +1060,29 @@ def cmd_init(args):
     db = db_path(home)
     use_fts = fts_available()
     schema = schema_path(home, args.schema)
+    sidecar = sidecar_path(home)
 
     if db.exists():
         con = connect(db)
         try:
-            if all(table_exists(con, t) for t in ("episodes", "facts", "intentions", "core", "journal")):
-                if not sidecar_path(home).exists():
-                    warn("%s 不存在：这个库没有审计链，删库就没法重建（备份包里应该有它）"
-                         % sidecar_path(home))
-                print("已初始化：%s" % db)
-                print("下一步：python3 mem.py check")
-                return EXIT_OK
-            raise MemError(
-                "memory.db 存在但不是本 schema（缺 episodes/facts/intentions/core/journal 表）。"
-                "为免覆盖数据，init 不继续；确认它没用之后手工删掉，或换一个 --home。", EXIT_STATE)
+            if not all(table_exists(con, t) for t in
+                       ("episodes", "facts", "intentions", "core", "journal")):
+                raise MemError(
+                    "memory.db 存在但不是本 schema（缺 episodes/facts/intentions/core/journal 表）。"
+                    "为免覆盖数据，init 不继续；确认它没用之后手工删掉，或换一个 --home。", EXIT_STATE)
+            before, after = migrate_schema(con)
+            if not sidecar.exists():
+                warn("%s 不存在：这个库没有审计链，删库就没法重建（备份包里应该有它）" % sidecar)
+            if before == after:
+                print("已初始化：%s（schema v%d，无需迁移）" % (db, SCHEMA_VERSION))
+            elif before == 0:
+                print("已升级：%s（旧库没有版本号，按 v1 处理 → schema v%d：core.origin + journal.v；"
+                      "未重建、未删数据）" % (db, SCHEMA_VERSION))
+            else:
+                print("已升级：%s（schema v%d → v%d：core.origin + journal.v；未重建、未删数据）"
+                      % (db, before, SCHEMA_VERSION))
+            print("下一步：python3 mem.py check")
+            return EXIT_OK
         finally:
             con.close()
 
@@ -807,18 +1090,21 @@ def cmd_init(args):
     try:
         with con:
             apply_schema(con, use_fts, schema)
+            con.execute("PRAGMA user_version=%d" % SCHEMA_VERSION)
     finally:
         con.close()
     # 审计文件从 init 这一刻起就存在：空文件也是合法的审计链起点
-    sidecar_path(home).touch()
+    sidecar.touch()
 
     print("家目录：%s" % home)
-    print("建表：episodes / facts / intentions / core / journal")
+    print("建表：episodes / facts / intentions / core / journal（schema v%d，user_version=%d）"
+          % (SCHEMA_VERSION, SCHEMA_VERSION))
     if use_fts:
         print("检索：FTS5 + trigram（mem_fts）")
     else:
         print("检索：LIKE（本机 SQLite 没有 FTS5/trigram，check 会报 WARN；中文仍可命中，只是慢）")
-    print("审计：%s（已创建；只追加，别手改）" % sidecar_path(home))
+    print("审计：%s（已创建；只追加，别手改；每条记录带 v=%d）"
+          % (sidecar, JOURNAL_RECORD_VERSION))
     print("下一步：python3 mem.py check")
     return EXIT_OK
 
@@ -906,6 +1192,76 @@ def _reject(errors, where):
     print("%s 有 %d 处不合法，数据库未改动：" % (where, len(errors)), file=sys.stderr)
     for err in errors:
         print("  " + err, file=sys.stderr)
+
+
+def cmd_ingest(args):
+    day = datetime.date.fromisoformat(resolve_day(args.day))
+    if args.max_chars < 1:
+        raise MemError("--max-chars 至少是 1", EXIT_USAGE)
+    if args.workspace:
+        workspace = normalize_workspace(args.workspace)
+        if not os.path.isdir(workspace):
+            raise MemError("--workspace 不是目录：%s" % workspace, EXIT_STATE)
+    else:
+        workspace = default_workspace()
+    root = sessions_root()
+    if not root.is_dir():
+        raise MemError(
+            "找不到会话目录：%s（她这台主机的 DSH 家目录下应该有 .dsh/sessions）" % root,
+            EXIT_STATE)
+
+    files = sorted(path for path in root.rglob(SESSION_FILENAME) if path.is_file())
+    skipped = {"workspace": 0, "preset": 0, "empty_day": 0}
+    sessions = []
+    for path in files:
+        lines = read_session_lines(path)
+        header = parse_session_header(lines[0] if lines else "", str(path))
+        header_workspace = workspace_of(header)
+        if header_workspace is None or header_workspace != workspace:
+            skipped["workspace"] += 1
+            continue
+        preset = header.get("agentPreset")
+        if isinstance(preset, str) and preset in MEMORY_TASK_PRESETS:
+            skipped["preset"] += 1
+            continue
+        records = []
+        for lineno, line in enumerate(lines[1:], 2):
+            if not line.strip():
+                continue
+            try:
+                record = json.loads(line)
+            except json.JSONDecodeError as exc:
+                raise MemError("会话文件第 %d 行不是合法 JSON：%s（%s）" % (
+                    lineno, path, exc.msg), EXIT_STATE)
+            if isinstance(record, dict):
+                records.append(record)
+        session = extract_session(header, records, day, str(path))
+        if session is None:
+            skipped["empty_day"] += 1
+            continue
+        sessions.append(session)
+
+    sessions.sort(key=lambda item: (item["entries"][0][0], item["id"]))
+    text, omitted = render_transcript(sessions, args.max_chars)
+    if text:
+        sys.stdout.write(text + "\n")
+    if omitted is not None:
+        warn("当天会话超长，已截断：上限 %d 字，输出后省略 %d 字" % (args.max_chars, omitted))
+    roles = {"对方": 0, "溟月": 0, "工具": 0}
+    for session in sessions:
+        for _when, role, _text in session["entries"]:
+            roles[role] += 1
+    total = sum(roles.values())
+    print("抽取 %d 个会话 / %d 行：对方 %d、溟月 %d、工具 %d；输出 %d 字%s"
+          "（扫描 %d 个会话，跳过：工作区 %d、任务预设 %d、当天无真人消息 %d）" % (
+              len(sessions), total, roles["对方"], roles["溟月"], roles["工具"],
+              len(text), "（已截断）" if omitted is not None else "",
+              len(files), skipped["workspace"], skipped["preset"], skipped["empty_day"]),
+          file=sys.stderr)
+    if not sessions:
+        print("当天没有可抽取的对话（扫描 %d 个会话，工作区 %s）" % (len(files), workspace),
+              file=sys.stderr)
+    return EXIT_OK
 
 
 def retrieve(con, terms):
@@ -1078,11 +1434,13 @@ def cmd_pin(args):
             "请先精简再 pin —— 不静默截断。" % (total, CORE_LIMIT, others, len(text)))
 
     before = rows.get(block)
-    if before is not None and before["text"] == text:
+    if (before is not None and before["text"] == text
+            and before.get("origin", "manual") == "manual"):
         print("[NOOP] core.%s 内容没变，未写入（合计 %d/%d 字）" % (block, total, CORE_LIMIT))
         return EXIT_OK
 
-    after = {"block": block, "text": text, "updated_at": now_iso()}
+    # pin 写出来的一律是 manual 块：core-refresh 永不覆盖
+    after = {"block": block, "text": text, "updated_at": now_iso(), "origin": "manual"}
     with con:
         upsert_row(con, "core", after)
         seq = record_op(con, home, "pin", block,
@@ -1094,8 +1452,8 @@ def cmd_pin(args):
     return EXIT_OK
 
 
-def render_region(con):
-    rows = {r["block"]: r["text"] for r in con.execute("SELECT block, text FROM core")}
+def render_region_from_rows(rows):
+    """rows: {block: text} → AGENTS.md 的 CORE 区文本（块顺序固定，空块跳过）。"""
     parts = [RENDER_PREAMBLE]
     for block in RENDER_ORDER:
         text = rows.get(block)
@@ -1106,6 +1464,11 @@ def render_region(con):
         parts.append("")
         parts.append(text.strip("\n"))
     return "\n".join(parts).rstrip("\n") + "\n"
+
+
+def render_region(con):
+    return render_region_from_rows(
+        {r["block"]: r["text"] for r in con.execute("SELECT block, text FROM core")})
 
 
 def replace_region(original, region):
@@ -1193,6 +1556,269 @@ def cmd_render(args):
     return EXIT_OK
 
 
+# ── core-refresh：把高 importance facts 模板化写进 core.auto ────────────────
+
+def auto_fact_text(text):
+    line = re.sub(r"\s+", " ", str(text)).strip()
+    line = line.rstrip("。！？!?；;，,、)")
+    if len(line) > AUTO_FACT_CHARS:
+        line = line[:AUTO_FACT_CHARS - 1] + "…"
+    return line
+
+
+def render_auto_text(facts):
+    """facts: 已按 importance 排序的文本；返回 (文本, 用到的条数, 句数)，3–5 句模板。"""
+    items = [item for item in (auto_fact_text(text) for text in facts) if item]
+    if not items:
+        return "", 0, 0
+    groups = ([[item] for item in items] if len(items) <= 5
+              else [items[index:index + 2] for index in range(0, len(items), 2)])
+    groups = groups[:len(AUTO_FRAMES)]
+    sentences = [AUTO_FRAMES[index] + "；".join(group) + "。"
+                 for index, group in enumerate(groups)]
+    return "".join(sentences), sum(len(group) for group in groups), len(sentences)
+
+
+def build_auto_text(facts, cap):
+    """超预算从低 importance 开始丢；返回 (文本, 条数, 句数)。"""
+    texts = [row["text"] for row in facts]
+    while texts:
+        text, used, sentences = render_auto_text(texts)
+        if len(text) <= cap:
+            return text, used, sentences
+        texts = texts[:-1]
+    return "", 0, 0
+
+
+def render_home(home, con):
+    """把当前 core 渲染进 AGENTS.md（原子写），返回 (path, 是否新建)。"""
+    rows = {r["block"]: r["text"] for r in con.execute("SELECT block, text FROM core")}
+    region = render_region_from_rows(rows)
+    path = agents_path(home)
+    existed = path.exists()
+    original = path.read_text(encoding="utf-8") if existed else None
+    new = replace_region(original, region) if existed else new_agents(region)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    atomic_write(path, new)
+    print("[RENDER] %s（%s，core 共 %d 字）" % (
+        path, "更新" if existed else "新建", sum(len(text) for text in rows.values())))
+    return path, not existed
+
+
+def cmd_core_refresh(args):
+    home = home_of(args)
+    con = open_db(home)
+    rows = {r["block"]: dict(r) for r in con.execute("SELECT * FROM core")}
+    manual_chars = sum(len(row["text"]) for row in rows.values()
+                       if row.get("origin", "manual") != "auto")
+    cap = min(AUTO_BLOCK_LIMIT, max(0, CORE_LIMIT - manual_chars))
+    facts = con.execute(
+        "SELECT id, text, importance FROM facts"
+        " WHERE archived_at IS NULL AND valid_to IS NULL"
+        " ORDER BY importance DESC, valid_from DESC, id LIMIT ?",
+        (AUTO_MAX_FACTS,)).fetchall()
+    text, used, sentences = build_auto_text(facts, cap)
+
+    existing = rows.get(AUTO_BLOCK)
+    if existing is not None and existing.get("origin", "manual") == "manual":
+        print("[NOOP] core.auto 是 manual（手工接管），不覆盖；只确保 render")
+        render_home(home, con)
+        return EXIT_OK
+    if (existing is not None and existing.get("origin") == "auto"
+            and existing["text"] == text):
+        print("[NOOP] core.auto 内容未变（%d 条 facts，%d 字）" % (used, len(text)))
+        render_home(home, con)
+        return EXIT_OK
+
+    # 预检 render：AGENTS.md 的 marker 坏了先报错、不写库（这文件会被注入每个会话）
+    proposed = {block: row["text"] for block, row in rows.items()}
+    proposed[AUTO_BLOCK] = text
+    path = agents_path(home)
+    existed = path.exists()
+    original = path.read_text(encoding="utf-8") if existed else None
+    region = render_region_from_rows(proposed)
+    new = replace_region(original, region) if existed else new_agents(region)
+
+    after = {"block": AUTO_BLOCK, "text": text, "updated_at": now_iso(), "origin": "auto"}
+    reason = "按 importance 重写 auto 块（%d 条 facts，%d 字）" % (used, len(text))
+    with con:
+        upsert_row(con, "core", after)
+        seq = record_op(con, home, "refresh", AUTO_BLOCK,
+                        {"table": "core", "row": existing} if existing else None,
+                        {"table": "core", "row": after}, reason,
+                        "cli:mem.py core-refresh")
+    path.parent.mkdir(parents=True, exist_ok=True)
+    atomic_write(path, new)
+    total = manual_chars + len(text)
+    print("[REFRESH] core.auto：%d 条 facts → %d 字 / %d 句（auto 上限 %d，manual 占 %d，"
+          "core 合计 %d/%d）" % (used, len(text), sentences, cap, manual_chars,
+                                 total, CORE_LIMIT))
+    print("journal seq %d" % seq)
+    print("[RENDER] %s（%s，core 共 %d 字）" % (path, "更新" if existed else "新建", total))
+    return EXIT_OK
+
+
+def decay_candidates(con, day):
+    """返回该归档的条目（已排除归档 / 已取代 / importance>=0.8 的），按表+id 排序。"""
+    out = []
+    for table, kind, date_column, where in (
+            ("facts", "fact", "valid_from",
+             "archived_at IS NULL AND valid_to IS NULL"),
+            ("episodes", "episode", "at", "archived_at IS NULL")):
+        for row in con.execute("SELECT * FROM %s WHERE %s" % (table, where)).fetchall():
+            before = dict(row)
+            importance = float(before["importance"])
+            if importance >= DECAY_IMPORTANCE_GUARD:
+                continue          # 重要的事交给人，不交给衰减曲线
+            last = before["last_used"] or before[date_column]
+            last_date = datetime.date.fromisoformat(date_part(last))
+            days = max(0, (day - last_date).days)
+            strength = importance * math.exp(-days / DECAY_TAU_DAYS)
+            if strength < DECAY_THRESHOLD:
+                out.append({"table": table, "kind": kind, "before": before,
+                            "strength": strength, "days": days,
+                            "last": last_date.isoformat()})
+    out.sort(key=lambda item: (item["table"], item["before"]["id"]))
+    return out
+
+
+def cmd_decay(args):
+    home = home_of(args)
+    con = open_db(home)
+    day = today()
+    scanned = {
+        "facts": con.execute(
+            "SELECT COUNT(*) FROM facts WHERE archived_at IS NULL AND valid_to IS NULL"
+        ).fetchone()[0],
+        "episodes": con.execute(
+            "SELECT COUNT(*) FROM episodes WHERE archived_at IS NULL").fetchone()[0],
+    }
+    candidates = decay_candidates(con, day)
+    archived = []
+    with con:
+        for cand in candidates:
+            after = dict(cand["before"], archived_at=now_iso())
+            upsert_row(con, cand["table"], after)
+            reason = "衰减：strength=%.4f < %.2f（%d 天未用，importance=%.2f，last=%s）" % (
+                cand["strength"], DECAY_THRESHOLD, cand["days"],
+                cand["before"]["importance"], cand["last"])
+            seq = record_op(con, home, "archive", cand["before"]["id"],
+                            {"table": cand["table"], "row": cand["before"]},
+                            {"table": cand["table"], "row": after},
+                            reason, "cli:mem.py decay")
+            archived.append((cand, seq))
+    for cand, _seq in archived:
+        print("[ARCHIVE] %s %s strength=%.4f（%d 天未用，importance=%.2f，last=%s）" % (
+            cand["kind"], cand["before"]["id"], cand["strength"], cand["days"],
+            cand["before"]["importance"], cand["last"]))
+    if archived:
+        seqs = [seq for _cand, seq in archived]
+        print("journal seq %d" % seqs[0]
+              if len(seqs) == 1 else "journal seq %d–%d" % (seqs[0], seqs[-1]))
+    print("扫描 facts %d / episodes %d，归档 %d 条（阈值 %.2f，τ=%d 天；"
+          "importance>=%.1f 永不自动归档）" % (
+              scanned["facts"], scanned["episodes"], len(archived),
+              DECAY_THRESHOLD, int(DECAY_TAU_DAYS), DECAY_IMPORTANCE_GUARD))
+    return EXIT_OK
+
+
+# ── import-profile：初始档案 → facts（幂等）──────────────────────────────
+
+def read_profile_items(path):
+    p = Path(os.path.expanduser(str(path)))
+    if not p.exists():
+        raise MemError("找不到初始档案：%s" % p, EXIT_STATE)
+    try:
+        text = p.read_text(encoding="utf-8-sig")
+    except OSError as exc:
+        raise MemError("读不了初始档案：%s（%s）" % (p, exc), EXIT_STATE)
+    items = []
+    for line in text.splitlines():
+        match = PROFILE_ITEM_RE.match(line)
+        if match:
+            item = match.group(1).strip()
+            if item:
+                items.append(item)
+    if not items:
+        raise MemError(
+            "初始档案里没有列表项：%s（每行一条「- ...」才有东西可导入）" % p, EXIT_INVALID)
+    return p, items
+
+
+def next_fact_number(con):
+    number = 0
+    for (ident,) in con.execute("SELECT id FROM facts"):
+        match = re.match(r"^f-(\d+)$", str(ident))
+        if match:
+            number = max(number, int(match.group(1)))
+    return number
+
+
+def cmd_import_profile(args):
+    home = home_of(args)
+    con = open_db(home)
+    path, items = read_profile_items(args.file)
+    episode = con.execute(
+        "SELECT * FROM episodes WHERE id=?", (PROFILE_EPISODE_ID,)).fetchone()
+    if episode is not None and (episode["kind"] != "event"
+                                or episode["source"] != PROFILE_SOURCE):
+        raise MemError(
+            "episode id %s 已被占用（kind=%r, source=%r），不是初始档案；"
+            "先确认这条情景，再决定改名或换库。" % (
+                PROFILE_EPISODE_ID, episode["kind"], episode["source"]), EXIT_INVALID)
+
+    known = {norm(row["text"]) for row in con.execute("SELECT text FROM facts")}
+    planned, duplicates = [], 0
+    for item in items:
+        key = norm(item)
+        if not key or key in known:
+            duplicates += 1
+            continue
+        known.add(key)
+        planned.append(item)
+    if not planned:
+        print("[NOOP] %s：%d 条都已在 facts 里，没有新增（出处 %s）" % (
+            path.name, len(items), PROFILE_EPISODE_ID))
+        return EXIT_OK
+
+    seqs = []
+    today_s = today().isoformat()
+    with con:
+        if episode is None:
+            episode_row = {
+                "id": PROFILE_EPISODE_ID, "at": now_iso(), "kind": "event",
+                "text": "初始档案 %s（导入 %d 条）" % (path.name, len(items)),
+                "importance": 0.5, "source": PROFILE_SOURCE,
+                "archived_at": None, "last_used": None,
+            }
+            upsert_row(con, "episodes", episode_row)
+            fts_put(con, "episode", PROFILE_EPISODE_ID, episode_row["text"])
+            seqs.append(record_op(con, home, "add", PROFILE_EPISODE_ID, None,
+                                  {"table": "episodes", "row": episode_row},
+                                  "初始档案导入", "cli:mem.py import-profile"))
+        number = next_fact_number(con)
+        for item in planned:
+            number += 1
+            fact_id = "f-%04d" % number
+            row = {"id": fact_id, "text": item, "valid_from": today_s, "valid_to": None,
+                   "confidence": PROFILE_CONFIDENCE, "importance": PROFILE_IMPORTANCE,
+                   "source_episode": PROFILE_EPISODE_ID, "superseded_by": None,
+                   "archived_at": None, "last_used": None}
+            upsert_row(con, "facts", row)
+            fts_put(con, "fact", fact_id, item)
+            seqs.append(record_op(con, home, "add", fact_id, None,
+                                  {"table": "facts", "row": row},
+                                  "初始档案（%s）" % PROFILE_SOURCE,
+                                  "cli:mem.py import-profile"))
+    print("[IMPORT] %s：%d 条，新增 %d、已存在 %d（出处 %s）" % (
+        path.name, len(items), len(planned), duplicates, PROFILE_EPISODE_ID))
+    if seqs:
+        print("journal seq %d" % seqs[0] if len(seqs) == 1
+              else "journal seq %d–%d" % (seqs[0], seqs[-1]))
+    print("下一步：python3 mem.py core-refresh")
+    return EXIT_OK
+
+
 def cmd_forget(args):
     home = home_of(args)
     con = open_db(home)
@@ -1270,9 +1896,10 @@ def cmd_report(args):
     print("溟月 · 周报 %s ~ %s" % (lo_s, hi_s))
     print("新增：情景 %d 条（活跃 %d / 归档 %d）、事实 %d 条（活跃 %d / 归档 %d）、意图 %d 条"
           % (ep_new, ep_new - ep_arch, ep_arch, f_new, f_new - f_arch, f_arch, i_new))
-    print("变更：更新 %d、取代 %d、合并 %d、归档 %d、复活 %d" % (
+    print("变更：更新 %d、取代 %d、合并 %d、归档 %d、复活 %d、刷新 %d" % (
         ops.get("update", 0), f_sup, ops.get("noop", 0),
-        ops.get("forget", 0), ops.get("adopt", 0)))
+        ops.get("forget", 0) + ops.get("archive", 0), ops.get("adopt", 0),
+        ops.get("refresh", 0)))
     print("意图：%s" % "、".join("%s %d" % (s, status.get(s, 0)) for s in INTENTION_STATUSES))
     if ops:
         print("审计：journal %d 行（%s）" % (
@@ -1332,6 +1959,7 @@ def _replay_into_memory(home, records):
     con.execute("PRAGMA foreign_keys=ON")
     use_fts = fts_available()
     apply_schema(con, use_fts, schema_path(home))
+    con.execute("PRAGMA user_version=%d" % SCHEMA_VERSION)
     replay_records(con, records)
     rebuild_fts(con, use_fts)
     return con, use_fts
@@ -1369,6 +1997,7 @@ def cmd_rebuild(args):
     try:
         with con:
             apply_schema(con, use_fts, schema_path(home))
+            con.execute("PRAGMA user_version=%d" % SCHEMA_VERSION)
             replay_records(con, records)
             rebuild_fts(con, use_fts)
             seq = record_op(con, home, "rebuild", str(db), None,
@@ -1439,6 +2068,33 @@ def cmd_check(args):
                 add("OK", "表 %s 存在（%d 行）" % (table, count))
             else:
                 add("FAIL", "表 %s 不存在" % table)
+
+        stored = schema_version(con)
+        add("OK" if stored == SCHEMA_VERSION else "FAIL",
+            "schema user_version=%d（期望 %d）" % (stored, SCHEMA_VERSION))
+        if stored == SCHEMA_VERSION:
+            if table_exists(con, "core"):
+                has_origin = "origin" in table_columns(con, "core")
+                add("OK" if has_origin else "FAIL",
+                    "core.origin 列存在" if has_origin else "core.origin 列不存在（schema v2 缺列）")
+                if has_origin:
+                    bad = con.execute(
+                        "SELECT COUNT(*) FROM core WHERE origin NOT IN (?, ?)",
+                        CORE_ORIGINS).fetchone()[0]
+                    add("OK" if bad == 0 else "FAIL",
+                        "core.origin 取值合法（manual / auto）" if bad == 0
+                        else "core.origin 有 %d 行不是 manual/auto" % bad)
+            if table_exists(con, "journal"):
+                has_v = "v" in table_columns(con, "journal")
+                add("OK" if has_v else "FAIL",
+                    "journal.v 列存在" if has_v else "journal.v 列不存在（schema v2 缺列）")
+                if has_v:
+                    bad = con.execute(
+                        "SELECT COUNT(*) FROM journal WHERE v NOT IN (?)",
+                        KNOWN_JOURNAL_VERSIONS).fetchone()[0]
+                    add("OK" if bad == 0 else "FAIL",
+                        "journal.v 取值在已知集合" if bad == 0
+                        else "journal.v 有 %d 行是未知版本" % bad)
 
         if all(table_exists(con, t) for t in ("facts", "episodes")):
             declared = con.execute(
@@ -1550,8 +2206,14 @@ def build_parser():
 
     sp = add("consolidate", "读 JSONL 候选，做 ADD/UPDATE/SUPERSEDE/NOOP 并写 journal")
     sp.add_argument("--jsonl", required=True, help="候选文件（- 表示 stdin）")
-    sp.add_argument("--day", help="默认今天；也接受 today / 今天")
+    sp.add_argument("--day", help="默认今天；也接受 today / 今天 / yesterday / 昨天")
     sp.add_argument("--reason", help="整批统一理由（行内 reason 优先）")
+
+    sp = add("ingest", "从磁盘会话文件抽取当天对话（zstd 多帧 → 纯文本）")
+    sp.add_argument("--day", help="默认今天；也接受 today / 今天 / yesterday / 昨天")
+    sp.add_argument("--workspace", metavar="DIR", help="只抽这个工作区（默认 ~/mingyue）")
+    sp.add_argument("--max-chars", type=int, default=INGEST_MAX_CHARS,
+                    help="输出上限，默认 %d 字；超出截断并在末尾注明" % INGEST_MAX_CHARS)
 
     sp = add("search", "检索，返回带分数的条目")
     sp.add_argument("query")
@@ -1570,6 +2232,12 @@ def build_parser():
     sp = add("render", "把 core 渲染进 AGENTS.md 的 marker 之间（原子写）")
     sp.add_argument("--file", help="默认 <home>/AGENTS.md")
     sp.add_argument("--check", action="store_true", help="只比对不落盘")
+
+    add("core-refresh", "按 importance 取 ≤8 条 facts 重写 core.auto 并 render 一次")
+    add("decay", "按衰减公式归档弱记忆（importance>=0.8 不归档，core 不参与）")
+
+    sp = add("import-profile", "把初始档案的列表项灌进 facts（幂等，先建 e-import-profile）")
+    sp.add_argument("file", help="me.md 路径")
 
     sp = add("forget", "归档一条（不物理删除）")
     sp.add_argument("id")
@@ -1592,9 +2260,13 @@ HANDLERS = {
     "init": cmd_init,
     "add-episode": cmd_add_episode,
     "consolidate": cmd_consolidate,
+    "ingest": cmd_ingest,
     "search": cmd_search,
     "pin": cmd_pin,
     "render": cmd_render,
+    "core-refresh": cmd_core_refresh,
+    "decay": cmd_decay,
+    "import-profile": cmd_import_profile,
     "forget": cmd_forget,
     "report": cmd_report,
     "rebuild": cmd_rebuild,

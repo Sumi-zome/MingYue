@@ -191,37 +191,41 @@ sh ~/mingyue/scripts/build-sharp.sh --rollback
 | 图片发链接 | 0 | 你把图传到图床，把 URL 发给她，`fetch.py` 去读 |
 | 换 Linux 主机（云） | 中 | glibc 环境 sharp 开箱可用 |
 
-### 未定位：sharp 修好之后附件/图片仍然失败（2026-11-17）
+### 已解决：真正的根因是 Android 拒绝两个系统调用（2026-11-17）
 
-编好 sharp 后（`OK bytes=96`）**发图和附件仍然失败**，说明 sharp 不是主因。已排除与未决：
+sharp 只是第一层。继续往下挖，发现**四处**上游 DSH 在 Android 上的不兼容，全都表现为"发图片/附件失败，日志里什么都没"：
 
-| 项 | 结论 | 依据 |
-|---|---|---|
-| sharp | 已排除 | 编通并验证；重启引擎后仍失败 |
-| 网络 / Tailscale | 已排除 | 文字收发正常 |
-| 模型 / 账号渠道 | 已排除 | API Key 渠道同样失败 |
-| 客户端差异 | 已排除 | App 与网页都失败 |
-| 附件目录缺失 | 已排除 | `mkdir ~/.dsh/attachments` 后重启仍失败 |
-| HTTP body 上限 | 已排除 | `--dump-config` 的 webserver 无上限配置 |
-| 会话争抢 | 已排除 | 关掉 App 后网页仍失败 |
-| 服务端日志 | **没有任何错误** | `web.log` 只有启动行与模型列表 |
+| # | 根因 | 症状指纹 | 修法 |
+|---|---|---|---|
+| ① | `sharp` 无 android-arm64 预编译包 | `Could not load the "sharp" module using the android-arm64 runtime` | 从源码编译（见上一节） |
+| ② | 落盘前**向上 fsync 到文件系统根**，撞上不可读的 `/data/data` | `EACCES: permission denied, open '/data/data'` | `syncDirectory` 遇 EACCES/EPERM/ENOENT 时跳过（尽力而为） |
+| ③ | 内容寻址用**硬链接**去重，Android 拒绝 `link()` | `EACCES ... link '…/tmp/…' -> '…/file-objects/…'` | 硬链接失败退化为 `copyFile` |
+| ④ | 错误被 `catch` 吞掉，只回 `gateway/internal` / `ATTACHMENT_WRITE_FAILED` | 日志干净、客户端只看到笼统错误 | 在 catch 里 `console.error` 打出底层错误 |
 
-**关键缺口**：拿不到服务端返回的原始错误码。App 只显示「附件上传失败」（图片显示「AI 正忙」，错误码 `session/agent-busy`），网页只显示「重试」，`web.log` 干净，HAR 里没有上传请求（上传走主 WebSocket，帧不进 HAR）。
+**一条命令修全部（幂等，带备份）**：
 
-**待做的判别实验（30 秒，决定是 App 还是主机）**：
+```bash
+bash ~/mingyue/scripts/fix-termux.sh          # 应用/修复全部补丁
+bash ~/mingyue/scripts/fix-termux.sh --check  # 只检查
+```
 
-> 在新手机上切到**本机引擎**，新建对话发一个 .txt。
-> - 能发 → App 没问题，问题在这台 Termux 主机（引擎在 Bionic 环境下的缺陷）
-> - 不能发 → App 自身的 bug，值得报上游
+`status.sh` 已经接了这个检查，每次看状态就能知道补丁还在不在。
 
-**如果不想继续查**：接受"文字 + 链接"，见上面的替代方案；上云（Linux 主机）后大概率自然恢复。
+**升级必读**：`npm i -g @deepseek-ai/dsh` 会覆盖 `node_modules` 里的**补丁和 sharp 编译产物**——升级后必须重跑一次 `fix-termux.sh`，否则附件又会坏。
+
+**怎么走到这里的（值得记住的方法）**：
+
+1. 客户端日志、`web.log`、HAR 全都沉默 → 别猜，**直接打 HTTP 端点**（`probe-upload.sh`）拿原始错误码
+2. 错误码被归类后仍不透明 → **在 catch 里加日志**（patch ④），让底层错误说话
+3. 每修一层都会露出下一层——**不要因为"修了还不行"就否定方向**，要看错误有没有变化
 
 ### 不要做
 
 - **不要**以为"两个客户端都挂 = 客户端有 bug"——处理逻辑在主机里
 - **不要**为这个去重建引擎、换账号、换模型
 - **不要**把它当成记忆系统故障——和 `mem.py` 完全无关
-- `ws://127.0.0.1:9231/ingest` 报错、`*.js.map` 404 都是噪音，主机上没有 9231
+- `ws://127.0.0.1:9231/ingest` 报错、`*.js.map` 404 都是噪音（客户端里的开发残留），主机上没有 9231
+- **不要**只改 `node_modules` 就以为万事大吉——升级后重跑 `fix-termux.sh`
 
 ---
 
