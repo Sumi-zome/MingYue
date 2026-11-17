@@ -611,6 +611,7 @@ ntfy App 已经够用。要做成原生通知，得在 `app/android/.../notify/`
 | C | 阶段 2b：内容理解 skill（先网页+小说，再视频） | 本文 §6.5 |
 | **D** | **阶段 2c：主动说话**（随机早安 + 主动找东西分享；ntfy 推送暂缓，先做"会话内主动"）✅ 2026-11-17 完成：`ping.py` + 两个规划任务（00:05 早安 / 00:10 分享），到点投递进用户会话已实测；见 [PROACTIVE.md](PROACTIVE.md) | [HANDOFF-MORNING.md](HANDOFF-MORNING.md) + [HANDOFF-SHARE.md](HANDOFF-SHARE.md) + 本文 §6.6–6.7 |
 | E | 阶段 3.1：改名与图标 | 本文 §7.1 |
+| **P** | **阶段 2e：人设调优（反 AI 味）**：删自我指涉、允许低信息量回复、禁止元讨论与三段式；带固定测试集 + 用户盲评协议 | [HANDOFF-PERSONA.md](HANDOFF-PERSONA.md) |
 | F | ~~阶段 3.2：Chat/Work 模式~~（已删除；如果真要做入口，见 §7.6） | 本文 §7.6 |
 | G | 验证 §11.4（PC 当 Work 主机） | 本文 §11.4 |
 | **H** | **阶段 4：加密备份 + 迁移接口 + WSL 演练** | [MIGRATION.md](MIGRATION.md) 全文 |
