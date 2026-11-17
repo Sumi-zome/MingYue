@@ -33,7 +33,7 @@
 | **"她"（人设/记忆/阅读）** | **不用写代码** | 预设 + 若干 Markdown + 一个**内容理解 skill** + 三个自动化任务 |
 | **推送** | **不用改 App** | 旧手机自建 ntfy，新手机装 ntfy App |
 
-**最重要的一句**：你要的"没有形象、纯文字、能跑工具、能主动找你、能读东西、自己整理记忆"的她，**既不是插件，也不需要改源码**——她是"一个 DSH 预设 + 一堆文本文件 + 一个内容理解 skill + 三个定时任务"。改源码只在三件事上才需要：改 App 名字/图标、做 Chat/Work 模式、加"URL 主机"类型。
+**最重要的一句**：你要的"没有形象、纯文字、能跑工具、能主动找你、能读东西、自己整理记忆"的她，**既不是插件，也不需要改源码**——她是"一个 DSH 预设 + 一堆文本文件 + 一个内容理解 skill + 三个定时任务"。改源码只在三件事上才需要：改 App 名字/图标、加"URL 主机"类型、加"她"的专属入口（后两件都可能永远不做）。
 
 ---
 
@@ -64,7 +64,7 @@
 │ Termux → Node → dsh web（127.0.0.1:3080）                          │
 │   ├─ $HOME/.dsh/           会话、凭据、缓存                         │
 │   ├─ ~/mingyue/memory.db    六层记忆（SQLite，见 MEMORY.md）          │
-│   ├─ ~/mingyue/AGENTS.md    核心记忆块（脚本每晚重写）                │
+│   ├─ ~/mingyue/AGENTS.md    核心记忆块（脚本每天凌晨重写）                │
 │   ├─ ~/mingyue/persona.md   人设卡（手写）                           │
 │   ├─ ~/mingyue/daily/       日记导出（给人看）                        │
 │   ├─ ~/mingyue/reads/       读过的内容（摘要 + 索引）                 │
@@ -306,7 +306,7 @@ App 支持多主机。PC 那台可选加（主机填 Tailscale 地址或局域�
 | 层 | 载体 | 谁写 | 对应人类记忆 |
 |---|---|---|---|
 | 工作记忆 | 当前会话上下文 | 引擎 | 工作记忆 |
-| **核心记忆** | `AGENTS.md` 的 CORE 块（≤1200 字） | 脚本每晚重写 | 自我/依恋 |
+| **核心记忆** | `AGENTS.md` 的 CORE 块（≤1200 字） | 脚本每天凌晨重写 | 自我/依恋 |
 | **情景记忆** | `episodes` 表 + `daily/` | 脚本 | 经历 |
 | **语义记忆** | `facts` 表（带 `valid_from/valid_to`） | 脚本 | 知识/事实 |
 | **前瞻记忆** | `intentions` 表（"明天问问他面试怎么样"） | 脚本 | 待办/意图 |
@@ -314,9 +314,12 @@ App 支持多主机。PC 那台可选加（主机填 Tailscale 地址或局域�
 
 三个循环：
 
-- **每晚**：模型抽取候选（JSONL）→ 脚本做 ADD/UPDATE/SUPERSEDE/NOOP 归并 → 落库 → 重建 FTS → 写审计 → 重写 `AGENTS.md` 的 CORE 块。
-- **每周日**：模型提"矛盾/重复/失效"三类提案 → 脚本校验执行 → 衰减归档 → 发一段"这周我记住了什么"给你。
+- **每天 04:00（抽昨天）**：`mem.py ingest --day yesterday` 从磁盘会话文件抽昨天的对话（cwd/来源过滤、工具压一行）→ 模型输出候选 JSONL → 脚本 ADD/UPDATE/SUPERSEDE/NOOP 归并 → 落库 → 重建 FTS → 写审计 → `core-refresh` 重写 `core.auto`（≤8 条 facts / 3–5 句 / ≤600 字）→ `render` 重写 `AGENTS.md` 的 CORE 区（04:10 沉淀段）。
+- **每周一 04:20**：`report --week` → `decay`（strength<0.15 归档，`importance>=0.8` 不归档）→ 模型提"矛盾/重复/失效"三类提案 → 发一段"这周我记住了什么"给你。
 - **每次回答前**：常驻 CORE + 按需 `mem.py search`（相关性 0.45 / 重要度 0.30 / 新鲜度 0.25），最多 8 条。
+
+首轮档案由 `mem.py import-profile me.md` 灌入（先建 `episode e-import-profile`，每条 fact 都带出处）；
+人设/规则由 `persona.md` + `rules.md` 经 `apply-manual.py` 拼进 `AGENTS.md` 手工区（render 不碰）。
 
 三条不可省的铁律：**没有出处不写**、**矛盾只能显式 supersede**、**能从 journal 重建**。
 
@@ -443,9 +446,11 @@ curl -s -d "$1" http://127.0.0.1:8090/mingyue >/dev/null
 
 ---
 
-## 7. 阶段 3：改 App（可选，按需）
+## 7. 阶段 3：改 App（**可选，可能永远不做**）
 
-> 前三阶段做完功能就齐了。这一节是"让它真的叫溟月、更像 Kimi"的可选工作。
+> 前三阶段做完功能就齐了，App 一行都不用改。这一节只是"哪天嫌麻烦时"的备选清单。
+> **2026-11-17 决定：删掉 Chat/Work 模式**——她要跨设备、24 小时在线、能跑工具，
+> 就必须住在主机上；那"入口"天然就是"App 连哪台主机"，不需要 App 里再造一个模式。
 
 ### 7.1 改名与图标（半天，低风险）
 
@@ -460,13 +465,13 @@ curl -s -d "$1" http://127.0.0.1:8090/mingyue >/dev/null
 **不要动** `app/pubspec.yaml` 的 `name`：会牵动全仓 `package:dsh_app/` 的 import。
 自用不分发时，Deepy/鲸娘素材可以留着（`ASSETS.md` 的限制针对再发布）。
 
-### 7.2 Chat / Work 模式（1–2 天，中等风险）
+### 7.2 （已删除）Chat / Work 模式
 
-现状：`RootGate` → `ModeHome` → 原生界面（`HomeShell`）/ 网页版（`WebHome`），模式状态在 `app/lib/state/ui_mode_state.dart`。
+2026-11-17 删除。原因：
 
-建议：不新增模式枚举，而是**保存"Chat 主机 ID"**，抽屉顶部加切换项；切 Chat 时把 ActiveHost 切过去、会话列表过滤成"她的会话"。不碰 `connection_state.dart`（唯一装配点），风险最小。
-
-涉及：`app/lib/state/hosts_state.dart`（多存一个字段）、`app/lib/ui/shell/sessions_drawer.dart`、可选 `feature_catalog.dart`。
+- 她的能力（跨设备同一份、24 小时、可跑工具）**只能由主机提供**，不是客户端模式能给的；
+- App 现有的"多主机切换"已经等价于模式切换，再包一层只是把同一件事换个说法；
+- 真觉得切换麻烦，有更便宜的做法（见 §7.4）。
 
 ### 7.3 "URL 主机" 类型（2–3 天，可选）
 
@@ -474,9 +479,31 @@ curl -s -d "$1" http://127.0.0.1:8090/mingyue >/dev/null
 
 不做也能完成本计划，只有你决定把 DSH 放云托管时才需要。
 
-### 7.4 把 ntfy 接进 App（不建议）
+### 7.4 更便宜的替代：不改代码也能少点几下
+
+在考虑"加一个入口"之前，先试试这三件（都是 App 已有的能力）：
+
+| 做法 | 效果 | 成本 |
+|---|---|---|
+| **置顶会话** | 她排在最上面，不用翻 | 0 |
+| **设置 → 连接上次使用的主机** | 打开 App 直接在她那台机器上 | 0 |
+| **桌面快捷方式 →「最近对话」** | 桌面一点直达 | 0 |
+
+三件都做完还是嫌麻烦，才轮到"专属入口"（改 Flutter，见 §7.6）。
+
+### 7.5 把 ntfy 接进 App（不建议）
 
 ntfy App 已经够用。要做成原生通知，得在 `app/android/.../notify/` 加长连接服务，是大工程。
+
+### 7.6 "她"的专属入口（未决，2–3 天）
+
+如果 §7.4 那三件仍然不够，再考虑这个。技术上可行的依据：**App 已经会"切主机 + 打开指定会话"**——通知点开直达会话走的就是这条路径（`notify_state.dart:776`、`system_entry_host.dart:146`、`pet_stage.dart:123` 都是同一个模式），入口只是把同一件事换个触发方式。
+
+要做的话需要三样：记住"她是哪台主机上的哪个会话"、一个入口位置（抽屉项 / 全部功能卡 / 会话置顶）、找不到会话时的降级（新建）。
+
+**真正的前置阻塞不是代码，是构建**：当前 Windows 上没有 Flutter / Android SDK / WSL，改一行也装不上。而且自建签名与官方包不同 → 必须卸载重装 → App 本地的主机配置会丢（她的记忆在主机上，不受影响）。
+
+**判断（2026-11-17）**：先做 §7.4 那三件零成本的，观察一周。如果一周后仍然每天嫌切换麻烦，再按"先建 Actions 构建 → 再改入口"的顺序做。
 
 ---
 
@@ -503,7 +530,7 @@ ntfy App 已经够用。要做成原生通知，得在 `app/android/.../notify/`
 | 手机聊天页里一个"她"的面板/状态条 | 原生插件（`dshGo` 清单） | ❌（写插件） | 暂不需要 |
 | 电脑/手机上的大肥鱼形象 | 网页插件，或 dsh-bigfish 的角色包 | ❌（用现成） | 已排除 |
 | 系统悬浮窗里飘着的宠物 | 只能改 App（Kotlin overlay） | ✅ | 不做 |
-| App 改名、Chat/Work 模式、URL 主机 | Flutter 改动 | ✅ | 阶段 3 |
+| App 改名、URL 主机、专属入口 | Flutter 改动 | ✅ | 阶段 3（可选，可能不做） |
 | 跨设备会话双向同步 | 需要引擎导入接口 | ✅ 引擎补丁 | 不做（做不到） |
 
 ---
@@ -514,11 +541,11 @@ ntfy App 已经够用。要做成原生通知，得在 `app/android/.../notify/`
 |---|---|---|---|
 | 0 | 旧手机后端 | 0 | 1–2 小时（含排错） |
 | 1 | App 连上 | 0 | 20 分钟 |
-| 2a | 人设 + 六层记忆（`mem.py` + `schema.sql`）+ 三个任务 | 一个 Python 文件（约 400 行）+ SQL schema | 1–2 天 |
+| **2a** | **人设 + 六层记忆（`mem.py` + `schema.sql`）+ 三个任务**：✅ 已完成上半（后端/连接/备份迁移实测；`init`/`add-episode`/`consolidate`/`search`/`pin`/`render`/`forget`/`report`/`rebuild`/`check` + selftest 13 条手机通过）；✅ 已完成下半（`ingest`/`core-refresh`/`decay`/`import-profile` + schema v2 + persona/rules/me + 三条任务 prompt；selftest 扩到 32 条，手机实测通过） | 一个 Python 文件（约 2000 行）+ SQL schema + prompt 文件 | 1–2 天 |
 | 2b | 内容理解 skill（网页/小说/有字幕视频） | 一个 Python 脚本，约 300–500 行 | 1–2 天 |
 | 2c | ntfy 推送 | 两个 shell 脚本 | 半小时 |
 | 3.1 | 改名/图标 | 少量编辑 | 半天 |
-| 3.2 | Chat/Work 模式 | 中等 | 1–2 天 |
+| 3.2 | ~~Chat/Work 模式~~（2026-11-17 删除） | — | 不做 |
 | 3.3 | URL 主机 | 中等 | 2–3 天 |
 | **4** | **加密备份 + 迁移接口 + WSL 演练** | `export.sh` / `bootstrap.sh` / `restore.sh` | 1 天 |
 | **2d** | **历史语料导入**（可选，一次性） | 一个解析+批处理脚本 | 1 天（含人工确认） |
@@ -579,10 +606,11 @@ ntfy App 已经够用。要做成原生通知，得在 `app/android/.../notify/`
 |---|---|---|
 | A | 阶段 0：旧手机搭后端 | 本文 §4 |
 | B | 阶段 2a：人设 + **六层记忆**（`mem.py` + schema）+ 三个整理任务 | 本文 §6.2–6.4 + [MEMORY.md](MEMORY.md) 全文 |
+| **B2** | **阶段 2a 下半：`ingest` / `core-refresh` / `decay` / `import-profile` + schema v2 + persona/rules/me + 三条任务 prompt**（✅ 代码与手机实测完成；定时任务已挂 每天 04:00 抽取 / 04:10 沉淀 / 周一 04:20 周反思，到点投递已用一次性任务验证，见 `schedules/SETUP.md` 部署记录） | [MEMORY.md](MEMORY.md) §3.1/§3.3/§4.2/§7 + `schedules/SETUP.md` |
 | C | 阶段 2b：内容理解 skill（先网页+小说，再视频） | 本文 §6.5 |
-| D | 阶段 2c：ntfy 推送 + 主动说话 | 本文 §6.6–6.7 |
+| **D** | **阶段 2c：主动说话**（随机早安 + 主动找东西分享；ntfy 推送暂缓，先做"会话内主动"） | [HANDOFF-MORNING.md](HANDOFF-MORNING.md) + [HANDOFF-SHARE.md](HANDOFF-SHARE.md) + 本文 §6.6–6.7 |
 | E | 阶段 3.1：改名与图标 | 本文 §7.1 |
-| F | 阶段 3.2：Chat/Work 模式 | 本文 §7.2 + `docs/architecture.md` |
+| F | ~~阶段 3.2：Chat/Work 模式~~（已删除；如果真要做入口，见 §7.6） | 本文 §7.6 |
 | G | 验证 §11.4（PC 当 Work 主机） | 本文 §11.4 |
 | **H** | **阶段 4：加密备份 + 迁移接口 + WSL 演练** | [MIGRATION.md](MIGRATION.md) 全文 |
 | **I** | **阶段 2d：历史语料导入**（依赖 B 的 `mem.py` 已就绪） | [IMPORT.md](IMPORT.md) 全文 |
