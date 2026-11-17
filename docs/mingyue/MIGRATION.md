@@ -202,7 +202,64 @@ python3 ~/mingyue/scripts/mem.py check
 
 ---
 
-## 8. 一句话
+## 8. 跨平台：她本来就是可移植的
+
+这不是巧合——设计时有三条约束就是为迁移留的：
+
+1. 脚本里**只用 `$HOME` / `$MINGYUE_HOME`**，不写死 Termux 路径
+2. `mem.py` **只用 Python 标准库**，不装任何 pip 包
+3. **导出格式就是迁移接口**（加密包 + manifest + 恢复脚本）
+
+| 组件 | Termux | Linux | Windows | 备注 |
+|---|---|---|---|---|
+| `mem.py` / `selftest.py` / `schema.sql` | ✅ | ✅ | ✅ | 纯 stdlib；Windows 上 `py -3` 实测过 |
+| `memory.db` / `journal.jsonl` / `AGENTS.md` / `reads/` | ✅ | ✅ | ✅ | 纯文本与 SQLite |
+| `export.sh` / `restore.sh` | ✅ | ✅ | ⚠️ | 需要 Git Bash；`zstd`/`age` 手动装 |
+| `status.sh` | ✅ | ✅ | ❌ | 它靠 `ps -ef`，Git Bash 的 ps 看不到 Windows 进程 → 需 `status.ps1` |
+| `bootstrap.sh` | ✅ | ✅ | ❌ | 只有 termux / linux 两条分支 |
+| 自启 | Termux:Boot | systemd | 计划任务 | |
+| `zstd` / `age` / `sqlite3` | `pkg` | `apt` | 手动装二进制 | |
+| `ntfy` | 静态二进制 | systemd | 不推荐 | Windows 上改用邮件或其它推送 |
+| 手机 App（溟月） | ✅ | ❌ | ❌ | 桌面端用 DSH Desktop，App 只是客户端 |
+
+### 真的搬过去时要做什么
+
+**搬到 Linux**：`bash bootstrap.sh linux` + `restore.sh`，几乎是开箱的（systemd 单元已内置）。
+
+**搬到 Windows**（把 PC 当主机）：
+1. 装 `age` / `zstd` / `sqlite3` 三个二进制，放进 PATH
+2. 写一个 `status.ps1`（用 `Get-Process` / `Get-NetTCPConnection` 替掉 `ps`）
+3. 自启靠 DSH App 的**托管启动**就够，不必做计划任务
+4. `mem.py ingest` 需要 `zstd.exe`，或者等你升到 Python 3.14（自带 `compression.zstd`）
+
+### 一条要守住的规矩
+
+**`mem.py` 永远只用 Python 标准库。**
+
+它是最值钱的资产：1400 行、13 条自检、跨平台验证过。一旦引入 pip 依赖，就同时失去"手机上能跑""Windows 上能跑""几年后还能跑"这三件事。
+
+---
+
+### 8.1 三个"版本头"：升级时靠它们判断怎么读
+
+光有"能搬"不够，还得能判断**搬到新版本上之后怎么读**。三个地方各要一个版本头：
+
+| 对象 | 版本载体 | 读取规则 |
+|---|---|---|
+| **数据库结构** | `PRAGMA user_version` | `init` 读版本 → 按需 `ALTER` → 写回；`check` 打印当前版本 |
+| **审计记录** | 每条 `journal.jsonl` 记录的 `v` 字段 | 缺省视为 `v:1`；重放按各自版本解析 |
+| **会话文件** | 文件名 `session.v4.jsonl.zstd` | 只认已知版本；**不认识就明确报错**，绝不当成空数据 |
+
+**规则一句话**：写入带版本，读取容忍"没有版本 = 1"，遇到不认识的版本就停下来报错。
+
+为什么现在定：窗口 C 要把 schema 从 v1 升到 v2（加 `core.origin`）。没有版本号，半年后你只会看到一堆列，猜不出它们是哪次加的、升级脚本该从哪一步开始。
+
+**反例（千万不要这样）**：`ingest` 遇到没见过的会话格式时返回空候选 → 定时任务"成功"了 → 她静默地什么都记不住 → 你两周后才发现。**认不出来就必须报错。**
+
+---
+
+## 9. 一句话
 
 **备份和迁移是同一件事**：把她的家打成一个加密包，里头带一份"怎么在新机器上重新站起来"的说明。
 云只是这个包的**目的地**之一，不是前提。
+**平台也一样**：她的记忆和脚本不绑在安卓上，绑的只是"启动方式"和"几个二进制工具"。
