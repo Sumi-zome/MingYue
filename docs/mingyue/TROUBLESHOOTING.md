@@ -86,6 +86,7 @@ App 里：主机 → 编辑 → **重启托管的 DSH**（这是文档给的正�
 | **多行粘贴被拼成一条** | PowerShell 出现 `>>` | 一行一条，或用 `;` 连接 |
 | **`ssh "..."` 里的引号被吃** | `grep "[d]sh web"` 变成 `grep dsh` | 用脚本文件，别在 `ssh "..."` 里塞引号 |
 | **`Get-Content` 默认 GBK** | 中文变乱码、JSON 校验假报错 | `-Encoding UTF8`；校验请用 Python 或 `py -3` |
+| **`.ps1` 里中文导致解析失败** | 报"字符串缺少终止符"、错误位置莫名其妙 | 文件必须存成 **UTF-8 with BOM**（PowerShell 5.1 无 BOM 时按 GBK 读）；`status.ps1` 文件头已注明 |
 | **`>` 重定向写坏二进制** | 解出来的包打不开 | 用程序自己的 `-o`（如 `age -d -o`） |
 | **ssh config 用 CRLF** | Git Bash 解析不到 Host | 写成 LF、无 BOM |
 | **`ProxyCommand connect` 不存在** | `Connection closed by UNKNOWN port 65535` | 注释掉，直连或改 `ssh.github.com:443` |
