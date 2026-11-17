@@ -9,8 +9,11 @@
 set -u
 
 NODE_ROOT="${PREFIX:-/data/data/com.termux/files/usr}/lib/node_modules"
-TARGET="$NODE_ROOT/@deepseek-ai/dsh/node_modules/@deepseek-ai/dsh-attachment-local/lib/index.js"
-BACKUP_DIR="$HOME/.cache/mingyue/attachment-link-backup"
+DSH_DIR="$NODE_ROOT/@deepseek-ai/dsh"
+TARGET="$DSH_DIR/node_modules/@deepseek-ai/dsh-attachment-local/lib/index.js"
+# 备份按 DSH 版本隔离：升级后旧备份不会被误还原进新版本
+VERSION="$(node -p "require('$DSH_DIR/package.json').version" 2>/dev/null || echo unknown)"
+BACKUP_DIR="$HOME/.cache/mingyue/attachment-link-backup-$VERSION"
 
 die() { echo "✗ $*" >&2; exit 1; }
 [ -f "$TARGET" ] || die "找不到 $TARGET"

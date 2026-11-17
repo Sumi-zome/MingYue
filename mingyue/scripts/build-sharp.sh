@@ -13,7 +13,9 @@ set -u
 NODE_ROOT="${PREFIX:-/data/data/com.termux/files/usr}/lib/node_modules"
 DSH_DIR="$NODE_ROOT/@deepseek-ai/dsh"
 SHARP_DIR="$DSH_DIR/node_modules/sharp"
-BACKUP_DIR="$HOME/.cache/mingyue/sharp-backup"
+# 备份按 DSH 版本隔离：升级后旧备份不会被误还原进新版本
+VERSION="$(node -p "require('$DSH_DIR/package.json').version" 2>/dev/null || echo unknown)"
+BACKUP_DIR="$HOME/.cache/mingyue/sharp-backup-$VERSION"
 
 die() { echo "✗ $*" >&2; exit 1; }
 

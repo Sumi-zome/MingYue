@@ -247,8 +247,8 @@ python3 ~/mingyue/scripts/mem.py check
 | 对象 | 版本载体 | 读取规则 |
 |---|---|---|
 | **数据库结构** | `PRAGMA user_version` | `init` 读版本 → 按需 `ALTER` → 写回；`check` 打印当前版本 |
-| **审计记录** | 每条 `journal.jsonl` 记录的 `v` 字段 | 缺省视为 `v:1`；重放按各自版本解析 |
-| **会话文件** | 文件名 `session.v4.jsonl.zstd` | 只认已知版本；**不认识就明确报错**，绝不当成空数据 |
+| **审计记录** | 每条 `journal.jsonl` 记录的 `v` 字段（库内 `journal.v` 同值镜像） | 缺省视为 `v:1`；重放按各自版本解析 |
+| **会话文件** | 文件名 `session.v4.jsonl.zstd` **+ 文件头** `version` / `sessionFormatVersion` | 只遍历 v4 文件名；文件头版本不在已知集合 `{4}` 或缺失 → **明确报错（退出码 4）**，绝不当成空数据。事件里的 `sessionFormatVersion` 有 v3→v4 迁移遗留值，不参与判定 |
 
 **规则一句话**：写入带版本，读取容忍"没有版本 = 1"，遇到不认识的版本就停下来报错。
 
