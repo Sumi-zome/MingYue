@@ -140,6 +140,15 @@ CREATE VIRTUAL TABLE mem_fts USING fts5(text, ref UNINDEXED, kind UNINDEXED, tok
 
 要求：宁可少提，不许推测；只写"对方明确说过"或"你亲眼看到"的。`reason` 写依据，不写复述。
 
+**输入从哪来**（2026-11-17 确认）：不是"让模型回忆今天聊了什么"——定时任务跑在自己的新会话里，看不到别的会话。真正的输入是磁盘上的会话文件：
+
+```
+~/.dsh/sessions/<工作区目录>/<会话目录>/session.v4.jsonl.zstd
+```
+
+所以抽取前要先 `mem.py ingest --day D`：zstd 解压 → 只留当天的消息 → 截掉工具调用正文 → 输出一段纯文本给模型。
+记录字段以实际文件为准（窗口 C 第一步探明），**不要猜格式**。
+
 > 可运行的样例见 `mingyue/samples/day-2026-11-16.jsonl`，改之前先拿它跑一遍 `consolidate`。
 
 ### 3.2 归并（脚本，决定性逻辑）
