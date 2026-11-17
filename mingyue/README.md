@@ -12,10 +12,15 @@ mingyue/
 │  ├─ schema.sql     记忆库表结构（mem.py init 逐条执行；schema v2）
 │  ├─ apply-manual.py把 persona.md + rules.md 拼进 AGENTS.md 手工区（render 不碰）
 │  ├─ selftest.py    mem.py 自查：python3 selftest.py（退出码 0 = 全过）
+│  ├─ persona-sample.py 人设盲测采样器：固定 5 句 × 3 轮，直接走引擎 RPC 抓回复
 │  ├─ export.sh      导出加密包（备份 = 迁移包）
 │  ├─ restore.sh     在新主机上恢复
 │  ├─ bootstrap.sh   新主机装依赖 + 自启（平台差异只在这里）
 │  ├─ status.sh      状态自检：sshd / 引擎 / 端口 / 家里 / 备份 / Termux 补丁
+│  ├─ ping.py        **主动投递**：窗口内随机取时刻 → 一次性任务投到用户会话（见下）
+│  ├─ morning-schedule.sh 随机早安入口（ping.py --config morning.json）
+│  ├─ share-schedule.sh   主动分享入口（ping.py --config share.json）
+│  ├─ bili-read.sh  读 B 站视频公开信号：元数据 + 弹幕采样 + 热评（免登录只读）
 │  ├─ fix-termux.sh  **Termux 兼容补丁总入口**：修附件/图片（见 TROUBLESHOOTING §7）
 │  ├─ build-sharp.sh 从源码编译 sharp（Termux 没有 Android 预编译包）
 │  ├─ patch-attachment-{durable,link,log}.sh  附件存储的三处 Android 兼容补丁
@@ -24,12 +29,21 @@ mingyue/
 ├─ persona.md         人设卡（源文件，apply-manual.py 拼进 AGENTS.md）
 ├─ rules.md           说话 + 检索规则（源文件，同上；写清"何时 search / 搜不到不许编"）
 ├─ me.md              初始档案（部署时 mem.py import-profile 灌一次，之后交给记忆系统）
+├─ memory-scopes.json 记忆抽取范围：哪些工作区的对话进记忆（见 docs/mingyue/WORKSPACES.md）
+├─ workspaces/        其他工作区的 AGENTS.md 模板：chat（聊天，仍进记忆）/ private（永不进记忆）
+├─ looks/             她的形象参考图（立绘 / 三视图 / Q版；persona 里写"认得自己"）
+├─ NOTICE.md          人设来源与许可（溟月 / CETACEA_LOLI，CC BY-NC-SA 4.0）
 └─ schedules/
    ├─ SETUP.md           迁移后重建定时任务的提示词（含前置检查与手动验收流程）
    ├─ night-extract.md   每天 04:00 抽取（ingest 昨天 → 模型输出候选 JSONL）
    ├─ night-consolidate.md 每天 04:10 沉淀（consolidate 昨天 → core-refresh → render）
-   └─ weekly-review.md   每周一 04:20 周反思（report → decay → ≤5 行总结）
+   ├─ weekly-review.md   每周一 04:20 周反思（report → decay → ≤5 行总结）
+   ├─ morning-hello.md   08:00–10:30 随机一刻的早安怎么说（行为规范）
+   └─ share-moment.md    12–14 / 21–23 随机一刻的主动分享（先搜再说话、去重、写法）
 ```
+
+> 主动说话的机制、配置（`morning.json` / `share.json`）、验证与排障见
+> [docs/mingyue/PROACTIVE.md](../docs/mingyue/PROACTIVE.md)。
 
 > 运行期数据（`memory.db`、`journal.jsonl`、`AGENTS.md`）不进仓库，留在主机上。
 
@@ -76,6 +90,7 @@ ssh -p 8022 u0_aXXX@100.x.y.z 'chmod +x ~/mingyue/scripts/*.sh'
 
 ```bash
 scp -P 8022 mingyue/persona.md mingyue/rules.md mingyue/me.md u0_aXXX@100.x.y.z:~/mingyue/
+scp -P 8022 -r mingyue/looks u0_aXXX@100.x.y.z:~/mingyue/   # 她的参考图（认得自己用）
 # 主机上：
 python3 ~/mingyue/scripts/apply-manual.py       # persona + rules → AGENTS.md 手工区（幂等）
 python3 ~/mingyue/scripts/mem.py import-profile ~/mingyue/me.md   # 一次性；重跑是 NOOP

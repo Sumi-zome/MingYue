@@ -29,7 +29,7 @@
 | 人类记忆 | 系统层 | 载体 | 谁写 | 生命周期 |
 |---|---|---|---|---|
 | 工作记忆 | **工作记忆** | 当前会话上下文 | 引擎 | 一轮对话 |
-| 自我/依恋 | **核心记忆** | `AGENTS.md` 的 CORE 块 | 脚本每晚重写 | 常驻，容量上限 |
+| 自我/依恋 | **核心记忆** | `AGENTS.md` 的 CORE 块 | 脚本每天凌晨重写 | 常驻，容量上限 |
 | 经历 | **情景记忆** | `episodes` 表 + `daily/*.md` | 脚本 | 永久（可归档） |
 | 知识/事实 | **语义记忆** | `facts` 表 | 脚本 | 带 `valid_to`，会被取代 |
 | 待办/意图 | **前瞻记忆** | `intentions` 表 | 脚本 | 到期后关闭 |
@@ -82,9 +82,10 @@ CREATE TABLE intentions (
 
 -- 核心：常驻上下文的那几百字
 CREATE TABLE core (
-  block      TEXT PRIMARY KEY,           -- self | user | relationship
+  block      TEXT PRIMARY KEY,           -- self | user | relationship | auto
   text       TEXT NOT NULL,
-  updated_at TEXT NOT NULL
+  updated_at TEXT NOT NULL,
+  origin     TEXT NOT NULL DEFAULT 'manual'  -- manual（pin 写的）| auto（core-refresh 写的）
 );
 
 -- 审计：库内这张表是**派生视图**，真源是家目录的 journal.jsonl
@@ -92,12 +93,13 @@ CREATE TABLE core (
 CREATE TABLE journal (
   seq    INTEGER PRIMARY KEY AUTOINCREMENT,
   at     TEXT NOT NULL,
-  op     TEXT NOT NULL,                  -- add|update|supersede|noop|pin|forget|adopt|rebuild
+  op     TEXT NOT NULL,                  -- add|update|supersede|noop|pin|forget|adopt|rebuild|refresh|archive
   target TEXT NOT NULL,
   before TEXT,                           -- 整行 JSON 信封，重放只依赖它
   after  TEXT,
   reason TEXT NOT NULL,
-  source TEXT NOT NULL
+  source TEXT NOT NULL,
+  v      INTEGER NOT NULL DEFAULT 1      -- 审计记录版本；缺省按 1 处理（见 MIGRATION §8.1）
 );
 
 -- 检索：SQLite 全文索引。
@@ -113,21 +115,25 @@ CREATE VIRTUAL TABLE mem_fts USING fts5(text, ref UNINDEXED, kind UNINDEXED, tok
 2. `facts` / `episodes` 不物理删除：改则 `superseded_by` 指向新条目 + `valid_to` 打时间；遗忘则打 `archived_at`。
 3. 每次写入必须带 `reason`（"对方明确说了" / "从日记第 2 条提升"）→ 进 `journal`。
 4. `core` 所有块合计 ≤ 1200 字；超了 `pin` **报错**，不静默截断、也不自动淘汰（淘汰哪条是人的判断，不该由脚本猜）。
+5. `block='auto'` 是脚本块（`origin='auto'`，由 `core-refresh` 重写）；`pin` 只能写 `self | user | relationship`（`origin='manual'`），**永不自动覆盖 manual 块**。`auto` 块自身 ≤600 字，manual 先占额度。
+
+**schema 版本头**：`PRAGMA user_version`，当前 **v2**（v2 = `core.origin` + `journal.v`）。
+`init` 读版本 → 在事务里 `ALTER TABLE` 逐级升到 v2（不 DROP、不重建、不动数据）→ 写回版本号；已是 v2 再跑 `init` 是空操作；版本比脚本新 → 拒绝并退出。
 
 ---
 
-## 3. 写入循环：每晚一次（抽取 → 归并 → 落库）
+## 3. 写入循环：每天凌晨一次（抽取 → 归并 → 落库）
 
-时间：每天 23:40。分两段，**模型只做前半段**。
+时间：每天 **04:00 抽取、04:10 沉淀**（凌晨跑的是"刚过去的昨天"：`--day yesterday`）。分两段，**模型只做前半段**。
 
 ### 3.1 抽取（模型）
 
 提示词让它读今天的会话 + 今天的 `reads/` 摘要，输出 **JSON Lines**。**顺序必须是先 episode、后 fact/intention**（后者要引用前者的 id）：
 
 ```json
-{"type":"episode","id":"e-20261116-01","at":"2026-11-16T21:00:00+08:00","kind":"chat","text":"对方聊到宿舍晚上断电","source":"session:<会话id>","importance":0.5,"reason":"对方明确说了"}
-{"type":"fact","text":"对方宿舍晚上断电","source_episode":"e-20261116-01","when":"2026-11-16","importance":0.6,"reason":"对方明确说了"}
-{"type":"intention","text":"问他毕业设计选了哪个题目","source_episode":"e-20261116-01","due":"2026-11-17","reason":"他说还没定"}
+{"type":"episode","id":"e-20261116-0412-01","at":"2026-11-16T21:00:00+08:00","kind":"chat","text":"对方聊到宿舍晚上断电","source":"session:<会话id>","importance":0.5,"reason":"对方明确说了"}
+{"type":"fact","text":"对方宿舍晚上断电","source_episode":"e-20261116-0412-01","when":"2026-11-16","importance":0.6,"reason":"对方明确说了"}
+{"type":"intention","text":"问他毕业设计选了哪个题目","source_episode":"e-20261116-0412-01","due":"2026-11-17","reason":"他说还没定"}
 ```
 
 **必填字段**（缺一个整批被拒，`mem.py` 会报行号）：
@@ -138,16 +144,66 @@ CREATE VIRTUAL TABLE mem_fts USING fts5(text, ref UNINDEXED, kind UNINDEXED, tok
 | `fact` | `text` `source_episode` `reason`（`when` 可省，默认当天） |
 | `intention` | `text` `source_episode` `reason`（`due` 可省） |
 
+> `episode.id` 必须唯一：建议 `e-YYYYMMDD-HHMM-NN`（含这次运行的时间，别照抄示例）；同一天重跑就换后缀。
+> 撞 id 时 `consolidate` **整批拒绝、不覆盖**（这是有意的），改候选里的 id 再重跑，不要改库。
+
 要求：宁可少提，不许推测；只写"对方明确说过"或"你亲眼看到"的。`reason` 写依据，不写复述。
 
-**输入从哪来**（2026-11-17 确认）：不是"让模型回忆今天聊了什么"——定时任务跑在自己的新会话里，看不到别的会话。真正的输入是磁盘上的会话文件：
+**输入从哪来**（2026-11-17 实测，会话格式 v4）：不是"让模型回忆今天聊了什么"——定时任务跑在自己的新会话里，看不到别的会话。真正的输入是磁盘上的会话文件：
 
 ```
-~/.dsh/sessions/<工作区目录>/<会话目录>/session.v4.jsonl.zstd
+~/.dsh/sessions/<工作区目录>/<session-id>/session.v4.jsonl.zstd
 ```
 
-所以抽取前要先 `mem.py ingest --day D`：zstd 解压 → 只留当天的消息 → 截掉工具调用正文 → 输出一段纯文本给模型。
-记录字段以实际文件为准（窗口 C 第一步探明），**不要猜格式**。
+- **第 1 行是文件头**：`{type, id, createdAt, cwd, agentPreset, version, …}`
+- **其余每行**：`{seq, time, type, data}` 事件流
+- **`cwd` 就是工作区**，在文件头里 → 用它过滤，**不要反推目录名的编码规则**
+- 要的事件：`user/message`、`assistant/message`
+- 不要的：`tool/call`、`tool/result`（压成一行摘要）、`step/*`、`turn/*`、`job/*`、`delivery-accepted`、`request/header`、`session/title-llm-request`
+- **`user/message` 还必须按 `data.source.kind == "user"` 过滤**：引擎会以 `user/message` 注入非人类内容，实测分布为
+  `time-context`（周期性时间）、`runtime-context`、`skill-catalog`、`agent-instructions`（**AGENTS.md 全文，含 CORE 记忆块**）、
+  `subagent-settled`、`retry`。不过滤 = 自喂（把自己的记忆当用户发言再抽取）+ 大量噪音。
+  **当天没有任何 `source.kind=="user"` 消息的会话，整段跳过**（定时任务自己的会话就是这样）。
+
+实测样本（桌面端一段长对话，3035 行）：`source.kind` 分布 `user=87 / time-context=32 / runtime-context=4 / subagent-settled=3 / agent-instructions=1 / skill-catalog=1 / retry=1`。
+
+实测样本：13 个会话、487 行里 `assistant/message` 52、`tool/call` 57、`tool/result` 57、`user/message` 22 —— **不过滤的话一半以上是工具噪音**。
+
+所以抽取前要先 `mem.py ingest --day D`：zstd 解压 → 按 `cwd` 和日期过滤 → 丢掉工具正文 → 输出一段纯文本给模型。
+**格式不认识就报错**，不许静默返回空候选（见 MIGRATION §8.1）。
+
+**`ingest` 的实现口径**（2026-11-17 定，窗口 C；2026-11-18 加多工作区范围）：
+
+| 项 | 口径 |
+|---|---|
+| 命令行 | `mem.py ingest --day D [--workspace DIR …] [--max-chars N]`；`--day` 默认今天，`--max-chars` 默认 60000。不给 `--workspace` 时读 `<家>/memory-scopes.json`（见 §3.1.1） |
+| 遍历 | `<会话根>/**/session.v4.jsonl.zstd`（会话根默认 `~/.dsh/sessions`）；文件名不是 v4 的不遍历 |
+| 会话头 | 首行 `type=="session"`。版本只认文件头里的 `version` / `sessionFormatVersion`，已知集合 `{4}`；缺失或不认识 → **报错、退出码 4，不返回空候选**。事件里的 `sessionFormatVersion` 有 v3→v4 迁移遗留值（实测出现过 `3`），**不能拿来判版本** |
+| 过滤 | 头部 `cwd` 规范化后必须在抽取范围里（且不在排除列表）；缺失/不匹配 → 跳过并计数。`agentPreset` 命中记忆任务预设名 → 跳过（双保险）；事件 `time`（毫秒）按**本地日期**过滤 |
+| 取舍 | `user/message` 且 `data.source.kind=="user"`；`assistant/message`；正文取 `content[]` 里 `type=="text"` 的 part（user 在 `data.content`，assistant 在 `data.message.content`）；`tool/call` → 一行，`tool/result` 丢弃；其它事件丢弃 |
+| 防自喂 | 当天没有真人消息（`source.kind=="user"`）的会话整段跳过（定时任务自己的会话就是这样） |
+| 输出 | 每个会话一行 `[会话 <id>]`；消息行 `[HH:MM] 角色: 文本`，角色 ∈ 对方 / 溟月 / 工具；工具行只写工具名（如 `[21:02] 工具: pwsh`），**不输出参数与结果正文**；会话之间空行 |
+| 截断 | 保留开头；超过 `--max-chars` 就停，末尾追加 `[截断] 超过上限 N 字，后面的内容已省略（共省略 M 字）。`；退出码仍 0 |
+| 错误 | 找不到 zstd / 会话根不存在 / 解压失败 / 文件不是 UTF-8 / 会话头坏 / JSON 行坏 / scopes 配置坏 → 各自可读错误 + **退出码 4**，不静默跳过 |
+| 空日 | stdout 空，stderr 报「当天没有可抽取的对话（扫描 N 个会话，工作区 X）」，退出码 0 |
+
+#### 3.1.1 多工作区范围（`memory-scopes.json`）
+
+2026-11-18：`~/chat`（聊天模式）的对话也要进记忆，`~/private` 永不进。
+范围写在 `<家>/memory-scopes.json`：
+
+```json
+{"include": ["~/mingyue", "~/chat"], "exclude": ["~/private"]}
+```
+
+- 缺文件 → 只抽 `$HOME/mingyue`（旧行为不变）
+- 配置里的目录不存在 → 告警跳过；全都不存在 → 退出码 4
+- 记忆单向：Chat 的对话进记忆，但 Chat 工作区不注入人设、不读 CORE
+- **记忆权重**：日常聊天（溟月闲聊 / Chat）自动抽出的条目默认 0.3–0.4（Chat 可再低到 0.2–0.3）；对方明确强调的才 0.6–0.9。实现方案见 [MEMORY-WEIGHT-PLAN.md](MEMORY-WEIGHT-PLAN.md)，口径见 [WORKSPACES.md](WORKSPACES.md) §记忆权重
+- 详细设计（含三个边界的实际差别）见 [WORKSPACES.md](WORKSPACES.md)
+
+> 记忆任务预设名暂定 `mingyue-memory`：三条定时任务建会话时用它，`ingest` 按它排除；
+> 若预设暂时建不出来，`source.kind` 过滤 + 空会话跳过这两条仍然兜底。
 
 > 可运行的样例见 `mingyue/samples/day-2026-11-16.jsonl`，改之前先拿它跑一遍 `consolidate`。
 
@@ -166,13 +222,23 @@ CREATE VIRTUAL TABLE mem_fts USING fts5(text, ref UNINDEXED, kind UNINDEXED, tok
 
 归并后：episodes 先落库 → facts 提升（带 `source_episode`）→ intentions 生成 → FTS 重建当日条目 → journal 记一行。
 
-### 3.3 生成核心记忆（脚本）
+### 3.3 生成核心记忆（脚本，`mem.py core-refresh`）
 
-从 `core` 表 + 最近 7 天的高 `importance` facts，重写 `AGENTS.md` 的 CORE 块（见 §5）。
+只重写 **`core` 表里 `origin='auto'` 的那一块**（块名 `auto`，渲染标题「## 最近」）；`origin='manual'` 的块（`pin` 写的）**永不覆盖**，内容取 importance 最高的 **≤8 条 facts**，模板拼接成 **3–5 句**，**不调模型**：
+
+- 取数：`facts WHERE archived_at IS NULL AND valid_to IS NULL ORDER BY importance DESC, valid_from DESC, id LIMIT 8`。
+- 模板：一句一条（≤5 条时）或两句一条（6–8 条时），句子框架固定
+  `最近我记着这些：` / `还有：` / `另外：` / `我也没忘：` / `最后：`；每条 fact 压成一行、去尾标点、>80 字截断加「…」。
+- 预算：`manual = Σ 所有 origin != 'auto' 的块字数`，`auto_cap = min(600, max(0, 1200 - manual))`（manual 优先占额度）。超预算从 importance 最低的 fact 开始丢；一条都放不下就写空串（空块不渲染）。
+- 写入：`core(block='auto', origin='auto')`；journal 记 `op=refresh`，`before/after` 整行信封，`v:1`。
+- 写完同一进程调 `render`；AGENTS.md 的 marker 有问题就**先报错、不写库**（预检）。
+- 内容没变 → `[NOOP]`，不写 journal（仍确保 render 一次）。
+
+`core` 的块顺序与标题见 §5.1。
 
 ---
 
-## 4. 维护循环：每周日 + 每月
+## 4. 维护循环：每周一 + 每月
 
 ### 4.1 周反思（模型提案 + 脚本校验）
 
@@ -184,17 +250,20 @@ CREATE VIRTUAL TABLE mem_fts USING fts5(text, ref UNINDEXED, kind UNINDEXED, tok
 
 脚本校验后执行，然后生成一段"这周我记住了什么"（5 行以内）通过 ntfy 发给你。
 
-### 4.2 衰减（脚本，纯数学）
+### 4.2 衰减（脚本，纯数学，`mem.py decay`）
 
 ```
 strength = importance × exp(-days_since_last_used / τ)      τ = 30 天
 ```
 
-- `strength < 0.15` → 打上 `archived_at`（**不删、不搬表**，仍可被检索召回）
+- 范围：`facts`（`archived_at IS NULL AND valid_to IS NULL`）+ `episodes`（`archived_at IS NULL`）；**`core` 不参与**（常驻块永不衰减）。
+- `last_used` 为空时用创建时间起算：facts 用 `valid_from`、episodes 用 `at` 的日期。
+- **`importance >= 0.8` 的条目永不自动归档**（重要的事交给人决定，不由衰减曲线猜）。
+- `strength < 0.15` → 打上 `archived_at`（**不删、不搬表**，仍可被检索召回），每条记 `journal op=archive`（`v:1`）。
 - **归档 = `archived_at` 非空**：默认检索不含；`search --include-archived` 可召回；
   显式命中后 `--adopt` 复活（清 `archived_at`、刷新 `last_used`）
 - `last_used` 在条目被再次提到（NOOP / UPDATE）或被采用（adopt）时刷新；**检索本身只读，不写库**
-- `core` 里的条目永不衰减
+- 输出：逐条 `[ARCHIVE] fact f-0001 strength=… （天数 / importance / last）`，末尾「扫描 facts N / episodes M，归档 K 条」；归档 0 条也退出 0。
 
 这是艾宾浩斯遗忘曲线的粗糙版；目的不是"忘掉"，是**别让 prompt 被陈年旧账塞满**。
 
@@ -210,7 +279,7 @@ strength = importance × exp(-days_since_last_used / τ)      τ = 30 天
 
 ### 5.1 常驻注入（零代码）
 
-DSH 会把工作区的 `AGENTS.md` 自动注入上下文。所以每晚脚本重写它：
+DSH 会把工作区的 `AGENTS.md` 自动注入上下文。所以每天凌晨脚本重写它：
 
 ```markdown
 <!-- MINGYUE:CORE:BEGIN （脚本维护，勿手改） -->
@@ -223,19 +292,31 @@ DSH 会把工作区的 `AGENTS.md` 自动注入上下文。所以每晚脚本重
 
 ## 最近
 - 他在忙毕业设计（11-16）。
-- 待问：毕业设计选了哪个题目（11-17）。
 <!-- MINGYUE:CORE:END -->
 
 <!-- 手工区：以下内容脚本不动 -->
-（你自己的规则写这里）
+（人设与说话/检索规则写这里，见 persona.md / rules.md）
 ```
+
+> 上例里「## 最近」就是 `core.auto` 块（`core-refresh` 写）；「关于对方 / 关于你」是 manual 块（`pin` 写）。
 
 用 marker 划分，脚本只替换两个 marker 之间的内容。**这就是 MemGPT 的 core memory，落到 AGENTS.md 上，不需要改引擎。**
 
 渲染由 `mem.py render` 做：原子写（临时文件 + `os.replace`，绝不半写；这文件会被注入每个会话）、
 只替换两个 marker 之间、**marker 外逐字节保留**、marker 缺失直接报错且不动原文件、
-块顺序固定 self → user → relationship → care → tone → narrative、同一份数据渲染两次字节完全相同。
-定时任务只负责**什么时候调** render，不负责拼内容。
+块顺序固定 self → user → relationship → **auto** → care → tone → narrative（标题：关于你 / 关于对方 / 我们之间 / 最近 / 此刻在意 / 此刻的语气 / 我们的事）、
+同一份数据渲染两次字节完全相同。定时任务只负责**什么时候调** render，不负责拼内容。
+
+**persona / rules 怎么生效（方案 A）**：DSH 只自动注入工作区的 `AGENTS.md`。`render` 只动 CORE marker 之间；
+`persona.md` + `rules.md` 由 `scripts/apply-manual.py` 拼进 **CORE marker 之外的手工区**（render 逐字节保留，永不改）。
+部署/改完 persona.md、rules.md 后跑一次：
+
+```
+python3 ~/mingyue/scripts/apply-manual.py          # 拼进 AGENTS.md 手工区（幂等）
+python3 ~/mingyue/scripts/apply-manual.py --check  # 只检查是否一致
+```
+
+手工区内容 = `persona.md` 全文 + 空行 + `rules.md` 全文（`<!-- 手工区：以下内容脚本不动 -->` 之后）。
 
 ### 5.2 按需检索（工具）
 
@@ -289,11 +370,12 @@ score = 0.45 × 相关性(FTS) + 0.30 × 重要度 + 0.25 × 新鲜度
 
 ### 5.3 何时检索
 
-写进 persona 的规则：
+写进 persona 的规则（现在落在 `rules.md` → `AGENTS.md` 手工区）：
 
 - 对方问"你还记得…"、提到过去的事、或你要主动提起某件事 → 先 `mem.py search`
 - 每次最多取 8 条，每条不超过 60 字
-- 没搜到就直说"我记不清了"，**不许编**
+- **搜到就直接说那件事**；不要只说"后台搜索跑完了 / 还是那些事"，也不提"搜索 / 后台 / 工具 / 记忆库"
+- 一件事都没搜到才说"我记不清了"，**不许编**
 
 ---
 
@@ -323,14 +405,19 @@ score = 0.45 × 相关性(FTS) + 0.30 × 重要度 + 0.25 × 新鲜度
 ├─ scripts/
 │  ├─ mem.py               # 全部子命令
 │  ├─ schema.sql
+│  ├─ apply-manual.py      # 把 persona.md + rules.md 拼进 AGENTS.md 手工区（render 不碰）
 │  └─ selftest.py          # 自查：python3 scripts/selftest.py
-├─ AGENTS.md               # CORE 块由 mem.py render 维护
-├─ persona.md              # 手工
-├─ rules.md                # 手工：说话规则、检索规则
+├─ AGENTS.md               # CORE 区由 mem.py render 维护；手工区由 apply-manual.py 维护
+├─ persona.md              # 手工：人设卡
+├─ rules.md                # 手工：说话规则、检索规则（会被拼进 AGENTS.md 手工区）
+├─ me.md                   # 手工：初始档案，mem.py import-profile 灌一次
 ├─ skills/content/         # 内容理解（PLAN §6.5）
 ├─ daily/                  # 每日导出给人看的 markdown
 └─ reads/                  # 读过的内容摘要与索引
 ```
+
+> `persona.md` / `rules.md` / `me.md` 是仓库里版本化的源；`AGENTS.md` 的手工区是部署产物，
+> 改完源文件跑一次 `apply-manual.py` 即可（幂等）。`me.md` 只在第一次部署时 `import-profile`。
 
 ### 7.2 `mem.py` 子命令
 
@@ -342,21 +429,27 @@ score = 0.45 × 相关性(FTS) + 0.30 × 重要度 + 0.25 × 新鲜度
 | `search "query" --k 8 [--json] [--include-archived] [--include-superseded] [--adopt ID --reason R]` | 检索，返回带分数的条目 | 已有 |
 | `pin BLOCK "text" --reason R` | 写核心记忆块（所有块合计 ≤1200 字，超了报错不截断） | 已有 |
 | `render [--check]` | 把 core 渲染进 `AGENTS.md` 的 marker 之间（原子写） | 已有 |
+| `core-refresh` | 按 importance 取 ≤8 条 facts，模板重写 `core.auto`（≤600 字，manual 优先）并 render 一次 | 已有 |
+| `decay` | 按 strength 公式归档弱记忆（`importance>=0.8` 不归档、core 不参与），journal 记 `archive` | 已有 |
 | `forget ID --reason R` | 归档一条（不物理删除） | 已有 |
 | `check` | 自检：表 / FTS trigram / 外键 / core 字数 / 审计文件 | 已有 |
 | `rebuild --from journal.jsonl` | 删库后从审计链重建 | 已有 |
 | `rebuild --check` | 重放校验，输出差异清单 | 已有 |
-| `extract --day DATE` | 输出当天对话给模型抽取（或校验模型给的 JSONL） | 下一窗口 |
-| `import-profile me.md` | 把初始档案灌进 `facts`（`source=me.md`，可重复执行、幂等） | 下一窗口 |
+| `ingest --day D [--workspace DIR …] [--max-chars N]` | 磁盘会话 → 当天纯文本：`zstd -dc` 解多帧 → cwd/日期过滤（范围来自 `memory-scopes.json`）→ 过滤注入与工具正文 → 输出 `[会话 <id>]` + `[HH:MM] 角色: 文本`，超长截断并注明 | 已有 |
+| `import-profile me.md` | 把初始档案的列表项灌进 `facts`：先建/复用 `episode e-import-profile`（`kind=event`、`source=me.md`），每条 fact 指向它（importance=0.9、confidence=0.9、`valid_from=今天`）；可重复执行、幂等 | 已有 |
 | `export --md` | 导出 daily/*.md 给人看 | 下一窗口 |
 
 ### 7.3 三个自动化任务
 
 | 任务 | 时间 | 提示词要点 |
 |---|---|---|
-| 抽取 | 23:40 | "读今天的会话，按 schema 输出 JSONL，宁可少写；不确定的不要写" |
-| 沉淀 | 23:50 | "运行 `mem.py consolidate --day 今天 --jsonl /tmp/today.jsonl --reason 日整理`，失败就报告错误，不要改数据" |
-| 周反思 | 周日 22:00 | "读最近 7 天 episodes 与 facts，提出矛盾/重复/失效三类提案，交脚本执行" |
+| 抽取 | 每天 04:00 | 读 `schedules/night-extract.md`：先 `mem.py ingest --day yesterday` 拿昨天的会话，再按 schema 输出候选到 `tmp/mingyue-extract.jsonl`；宁可少写，ingest 报错就停 |
+| 沉淀 | 每天 04:10 | 读 `schedules/night-consolidate.md`：`consolidate --day yesterday` → `core-refresh` → `render`，失败就报告错误，不要改数据 |
+| 周反思 | 每周一 04:20 | 读 `schedules/weekly-review.md`：`report --week` → `decay` → ≤5 行总结；只提案，不自己改库 |
+
+> 三条任务都投递到**新会话**（`target.kind=new`，cwd=`~/mingyue`），时区 `Asia/Shanghai`。
+> 前置：新会话默认权限必须是 `danger-full-access`（Android 无沙箱，否则无人值守的 bash 会失败）。
+> `agentPreset="mingyue-memory"` 是第二道防自喂锁（可选，需主机先注册该 preset）。
 
 > 注意：**模型的输出必须过脚本校验**。`consolidate` 遇到不合法的行整行拒绝并回显原因，不静默吞。
 

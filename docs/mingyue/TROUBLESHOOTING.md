@@ -117,6 +117,8 @@ App 里：主机 → 编辑 → **重启托管的 DSH**（这是文档给的正�
 | `ingest` 报"不认识的会话格式版本" | 会话头 `version`/`sessionFormatVersion` 不是 4。先看 `zstd -dc <文件> \| head -1`；**不要删会话文件**，也不要当成空数据跳过 |
 | `ingest` 输出 0 条 | 先看 stderr 的扫描/跳过计数：① `--workspace` 和会话头 `cwd` 不一致（App 工作目录是 `~/mingyue`）② 当天没有真人消息 ③ 当天只有定时任务会话（会被防自喂跳过）。**不要**为了凑数据手改过滤 |
 | 抽出来的文本里混进 AGENTS.md / 任务提示词 | `ingest` 应该按 `data.source.kind=="user"` 过滤且跳过无真人消息的会话；再看任务会话的 `agentPreset` 是否命中记忆任务预设名（双保险） |
+| 在 `~/chat`（Chat 模式）聊了，但第二天没进记忆 | ① 看 `~/mingyue/memory-scopes.json` 的 `include` 里有没有 `~/chat`（缺文件时只抽 `~/mingyue`）；② 手动跑 `mem.py ingest --day yesterday`，看 stderr 里「工作区 N」跳过了多少。**不要**直接把 `ingest` 改成扫全部工作区——那会把 `~/private` 带进来 |
+| 换了工作区后夜间任务整轮报错退出码 4 | `memory-scopes.json` 里的目录全都不存在（比如删了 `~/chat`）。脚本会告警跳过单个不存在的目录，但要求至少有一个可用 |
 | 命令报「memory.db 是旧 schema」 | 引擎脚本升级过而库还没迁移：跑一次 `python3 ~/mingyue/scripts/mem.py init`（幂等，只 `ALTER TABLE`，不删数据），再 `check` |
 | `init` 报 schema 版本比脚本新 | 库是更新版本脚本建的；不要用旧脚本动它——换回新脚本或从备份恢复 |
 | `core-refresh` 后「最近」没变 | ① facts 为空 ② 内容和上次一样（`[NOOP]`）③ `core.auto` 的 origin 被手工改成了 `manual`（脚本不覆盖 manual）。先跑 `mem.py check` 看 schema/字数 |

@@ -1,0 +1,4 @@
+{
+  "include": ["~/mingyue", "~/chat"],
+  "exclude": ["~/private"]
+}

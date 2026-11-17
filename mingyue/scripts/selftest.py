@@ -573,6 +573,41 @@ class MemTest(unittest.TestCase):
         self.assertIn("version=3", proc.stderr)
         self.assertEqual(proc.stdout.strip(), "")
 
+    @unittest.skipUnless(ZSTD, "本机没有 zstd：真解压端到端在手机上跑")
+    def test_20b_ingest_memory_scopes(self):
+        """memory-scopes.json：include 里的工作区都抽，exclude 里的跳过（docs/mingyue/WORKSPACES.md）。"""
+        chat_dir = self.home / "chat"
+        private = self.home / "private"
+        for d in (self.workspace(), chat_dir, private):
+            d.mkdir(parents=True, exist_ok=True)
+        (self.home / "memory-scopes.json").write_text(json.dumps({
+            "include": [str(self.workspace()), str(chat_dir)],
+            "exclude": [str(private)],
+        }), encoding="utf-8")
+        base = datetime.datetime(2026, 11, 16, 9, 0)
+        for name, cwd, text in (
+            ("main", self.workspace(), "主工作区的话"),
+            ("chat", chat_dir, "正经工作区的话"),
+            ("private", private, "隐私工作区的话"),
+        ):
+            self.write_session(
+                "proj/" + name,
+                [self.event(1, base, "user/message",
+                            self.text_message("user", "user", text))],
+                session_id="session-" + name, cwd=cwd)
+        proc = self.run_mem("ingest", "--day", "2026-11-16")
+        self.assertIn("主工作区的话", proc.stdout)
+        self.assertIn("正经工作区的话", proc.stdout)
+        self.assertNotIn("隐私工作区的话", proc.stdout)
+        self.assertIn("工作区 1", proc.stderr)
+
+    def test_20c_ingest_bad_scopes_is_loud(self):
+        """memory-scopes.json 格式错 → 退出码 4，不静默退回单工作区。"""
+        (self.home / "memory-scopes.json").write_text('{"include": []}', encoding="utf-8")
+        (self.home / ".dsh" / "sessions").mkdir(parents=True, exist_ok=True)
+        proc = self.run_mem("ingest", "--day", "2026-11-16", expect=4)
+        self.assertIn("include 必须是非空数组", proc.stderr)
+
     # ── schema v2 / core-refresh：验收 ────────────────────────────────
 
     def test_21_schema_v2_migrates_legacy_db_in_place(self):

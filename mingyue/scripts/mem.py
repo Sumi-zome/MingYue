@@ -67,6 +67,7 @@ MARK_END = "<!-- MINGYUE:CORE:END -->"
 MARK_BEGIN_LINE = "<!-- MINGYUE:CORE:BEGIN （脚本维护，勿手改） -->"
 MANUAL_HINT = "<!-- 手工区：以下内容脚本不动 -->"
 SIDECAR_NAME = "journal.jsonl"
+SCOPES_NAME = "memory-scopes.json"   # 抽取范围（docs/mingyue/WORKSPACES.md）
 
 # ingest：磁盘会话 → 当天纯文本（口径见 docs/mingyue/MEMORY.md §3.1）
 KNOWN_SESSION_VERSIONS = (4,)
@@ -937,6 +938,39 @@ def workspace_of(header):
     return normalize_workspace(cwd)
 
 
+def scopes_path(home):
+    return home / SCOPES_NAME
+
+
+def load_memory_scopes(home):
+    """抽取范围：<家>/memory-scopes.json，缺文件时只抽 ~/mingyue（旧行为）。
+
+        {"include": ["~/mingyue", "~/chat"], "exclude": ["~/private"]}
+
+    include 是白名单（别的都跳过），exclude 在 include 之后再排除一层。
+    返回 (include, exclude, from_config)：from_config=False 表示用的是默认回退，
+    此时调用方不做"目录必须存在"的校验（保持旧行为）。
+    """
+    path = scopes_path(home)
+    if not path.is_file():
+        return [default_workspace()], [], False
+    try:
+        raw = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as exc:
+        raise MemError("读不了 %s：%s" % (path, exc), EXIT_STATE)
+    if not isinstance(raw, dict):
+        raise MemError("%s 必须是 JSON 对象" % path, EXIT_STATE)
+    include = raw.get("include")
+    exclude = raw.get("exclude", [])
+    if not isinstance(include, list) or not include:
+        raise MemError("%s 的 include 必须是非空数组" % path, EXIT_STATE)
+    if not isinstance(exclude, list):
+        raise MemError("%s 的 exclude 必须是数组" % path, EXIT_STATE)
+    include_dirs = [normalize_workspace(item) for item in include]
+    exclude_dirs = [normalize_workspace(item) for item in exclude]
+    return include_dirs, exclude_dirs, True
+
+
 def parse_session_header(line, label):
     """校验会话头：type=session、id 有值、版本只在已知集合里。"""
     if not line.strip():
@@ -1199,11 +1233,26 @@ def cmd_ingest(args):
     if args.max_chars < 1:
         raise MemError("--max-chars 至少是 1", EXIT_USAGE)
     if args.workspace:
-        workspace = normalize_workspace(args.workspace)
-        if not os.path.isdir(workspace):
-            raise MemError("--workspace 不是目录：%s" % workspace, EXIT_STATE)
+        include = []
+        for raw in args.workspace:
+            workspace = normalize_workspace(raw)
+            if not os.path.isdir(workspace):
+                raise MemError("--workspace 不是目录：%s" % workspace, EXIT_STATE)
+            include.append(workspace)
+        exclude = []
     else:
-        workspace = default_workspace()
+        include, exclude, from_config = load_memory_scopes(home_of(args))
+        if from_config:
+            missing = [ws for ws in include if not os.path.isdir(ws)]
+            for ws in missing:
+                warn("抽取范围里的工作区不存在，已跳过：%s" % ws)
+            include = [ws for ws in include if os.path.isdir(ws)]
+            if not include:
+                raise MemError(
+                    "抽取范围里没有任何可用工作区（见 %s）" % scopes_path(home_of(args)),
+                    EXIT_STATE)
+    include_set = set(include)
+    exclude_set = set(exclude)
     root = sessions_root()
     if not root.is_dir():
         raise MemError(
@@ -1217,7 +1266,8 @@ def cmd_ingest(args):
         lines = read_session_lines(path)
         header = parse_session_header(lines[0] if lines else "", str(path))
         header_workspace = workspace_of(header)
-        if header_workspace is None or header_workspace != workspace:
+        if header_workspace is None or header_workspace not in include_set \
+                or header_workspace in exclude_set:
             skipped["workspace"] += 1
             continue
         preset = header.get("agentPreset")
@@ -1259,8 +1309,8 @@ def cmd_ingest(args):
               len(files), skipped["workspace"], skipped["preset"], skipped["empty_day"]),
           file=sys.stderr)
     if not sessions:
-        print("当天没有可抽取的对话（扫描 %d 个会话，工作区 %s）" % (len(files), workspace),
-              file=sys.stderr)
+        print("当天没有可抽取的对话（扫描 %d 个会话，工作区 %s）" % (
+            len(files), "、".join(include)), file=sys.stderr)
     return EXIT_OK
 
 
@@ -2211,7 +2261,8 @@ def build_parser():
 
     sp = add("ingest", "从磁盘会话文件抽取当天对话（zstd 多帧 → 纯文本）")
     sp.add_argument("--day", help="默认今天；也接受 today / 今天 / yesterday / 昨天")
-    sp.add_argument("--workspace", metavar="DIR", help="只抽这个工作区（默认 ~/mingyue）")
+    sp.add_argument("--workspace", metavar="DIR", action="append",
+                    help="只抽这个工作区（可重复；默认读 memory-scopes.json，缺失时只抽 ~/mingyue）")
     sp.add_argument("--max-chars", type=int, default=INGEST_MAX_CHARS,
                     help="输出上限，默认 %d 字；超出截断并在末尾注明" % INGEST_MAX_CHARS)
 
