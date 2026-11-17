@@ -6,6 +6,7 @@
 > 详见 [MEMORY.md](MEMORY.md)。本文 §6.4 只保留摘要。
 > **v1.3：新增 [MIGRATION.md](MIGRATION.md)**——备份与主机迁移是同一套东西，导出格式就是"上云/换机"的升级接口。
 > **v1.4：新增 [IMPORT.md](IMPORT.md)**——历史聊天不导入成会话（做不到），导入成记忆（episodes/facts/arcs）。
+> **v1.5：新增 [TROUBLESHOOTING.md](TROUBLESHOOTING.md)**——已踩过的坑（断连、引号、编码、`/tmp`、token）。
 >
 > 面向「只自己用、不上架」的场景，目标是**能跑通、能验收、能分窗口推进**，不是产品发布方案。
 > 仓库基线：fork `Sumi-zome/MingYue`，`main` 与 `origin/main` 同步于 `f5fa9256`，引擎锁定 `@deepseek-ai/dsh 0.2.2-rc.1`。
