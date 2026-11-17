@@ -213,6 +213,21 @@ bash ~/mingyue/scripts/fix-termux.sh --check  # 只检查
 
 **升级必读**：`npm i -g @deepseek-ai/dsh` 会覆盖 `node_modules` 里的**补丁和 sharp 编译产物**——升级后必须重跑一次 `fix-termux.sh`，否则附件又会坏。
 
+升级操作顺序：
+
+```bash
+bash ~/mingyue/scripts/status.sh                # 升级前：确认现在是好的
+npm i -g @deepseek-ai/dsh@<目标版本>             # 升级（注意 App 的版本耦合，见 UPSTREAM.md）
+bash ~/mingyue/scripts/fix-termux.sh --check    # 升级后：看缺了哪些
+bash ~/mingyue/scripts/fix-termux.sh            # 一条命令补齐
+# 然后在 App 里重启托管的 DSH，发一张图验证
+```
+
+两个安全设计：
+
+- **补丁是"认字符串"的**：上游改了那几行代码，脚本会**中止并还原**，不会留下半截状态。真中止了就把输出贴出来，补丁要跟着改。
+- **备份按版本隔离**（`~/.cache/mingyue/*-backup-<版本>`）：升级后不会误把旧版本文件还原进新版本。
+
 **怎么走到这里的（值得记住的方法）**：
 
 1. 客户端日志、`web.log`、HAR 全都沉默 → 别猜，**直接打 HTTP 端点**（`probe-upload.sh`）拿原始错误码
@@ -229,7 +244,74 @@ bash ~/mingyue/scripts/fix-termux.sh --check  # 只检查
 
 ---
 
-## 8. 记录新坑的格式
+## 8. 主动说话（阶段 2c）的坑
+
+> 机制与日常命令见 [PROACTIVE.md](PROACTIVE.md)。这里只记踩过的坑。
+
+### 8.1 到点了，她的消息没出现在聊天里
+
+| 症状 | 真因 | 30 秒确认 |
+|---|---|---|
+| 定时任务列表里有「溟月·早安/分享」，到点后会话里没有消息 | `target.kind` 被建成了 `new`：她在一个新会话里自言自语，你在聊天里看不到 | 读 `~/.dsh/storages/schedule.json`：任务的 `target.kind` 必须是 `session` 且 `sessionId` 是你正在聊的那个 |
+
+```bash
+python3 - <<'PY'
+import json, os
+d = json.load(open(os.path.expanduser('~/.dsh/storages/schedule.json')))
+for t in d['tables']['tasks'].values():
+    r = t['record']
+    if r.get('title') in ('溟月·早安', '溟月·分享'):
+        print(r['title'], t['status'], r['scheduledAt'], t['target'], (t.get('lastDelivery') or {}).get('targetSessionId'))
+PY
+```
+
+`lastDelivery` 不为空就说明**投递成功**（别翻聊天记录判断）。`target` 是 `new` 就把当天那条删掉、按
+`PROACTIVE.md` §4 用 `--set-target` 重建。
+
+### 8.2 定时任务会话整轮失败：`no adapter registered for provider "amazon-bedrock"`
+
+- **症状**：到点投递进去了，但那一轮没有任何回复；会话日志里是 `NO_ADAPTER`。手动聊天正常（App 里选过模型）。
+- **真因**：profile 的默认模型（`~/.dsh/profiles/web/cordis.patch.yml` 的 `agent-default-model`）被设成了
+  `amazon-bedrock / anthropic.claude-fable-5-1`，主机没有 bedrock 适配器。聊天没事是因为 App 给每个会话显式选了模型；
+  **定时任务新建的会话走默认模型**，整轮失败。
+- **修**：`sh ~/mingyue/scripts/fix-default-model.sh`（改成 `deepseek-account / deepseek-flash`，带备份），
+  再在 App 里重启托管的 DSH 让配置生效。验证：建一条 `--in 120` 的测试任务，看它真的回了话。
+
+### 8.3 她收到提醒却回"文件不存在，没步骤可跑"
+
+- **真因**：`~/mingyue/schedules/morning-hello.md` / `share-moment.md` 没 scp 到主机（仓库里有、主机上没有）。
+- **修**：`scp mingyue/schedules/*.md mingyue:mingyue/schedules/`。
+- **这其实是正确行为**：她没编，如实报了缺文件。以后改行为规范记得同步到主机。
+
+### 8.4 手动重跑 `morning-schedule.sh` 什么都不做
+
+- **症状**：输出"今天已经安排过：… 跳过"。
+- **真因**：`~/mingyue/tmp/morning-state.json` 记了今天（幂等，防重复）。
+- **修**：要重排就加 `--force`；只是看看就用 `--dry-run`；测试投递用 `--in 180`（不写幂等标记）。
+
+### 8.5 `web_fetch` 偶发 `DeepSeek API error (HTTP 404)`
+
+- **症状**：`tool/result` 里是 `Error: DeepSeek API error (HTTP 404): failed to fetch URL`，同一轮后面又成功了。
+- **真因**：`web-deepseek-api` 的 fetch 端点对个别 URL 404；工具会自动走 `web-fetch-http` 兜底。
+- **处理**：换候选或再试一次即可；连续失败就按"没读到"处理（`share-moment.md` 已写死"没读过不许发"）。
+  凭证错误是另一回事（会明确报 `WEB_PROVIDER_CREDENTIAL_MISSING`）；**正常路径不要求单独配 API key**——
+  会话模型是 `deepseek-account/…` 时，搜索/对话用账号登录态。
+
+### 8.6 B 站弹幕只解析出一条
+
+- **真因**：弹幕 XML 整篇是一行，`sed` 的贪婪匹配只会命中最后一条。
+- **修**：先 `sed 's|</d>|</d>\n|g'` 断行再逐条取（`bili-read.sh` 已这么写）；不要改用下载视频再抽帧，手机扛不住。
+
+### 8.7 不要做的
+
+- 不要为了"一定能说上话"加多重试/兜底投递——宁少勿多，失败留痕即可。
+- 不要把 `target.kind` 改成 `new_once` 来"复用会话"：那会绑到第一次投递的会话，反而更偏。
+- 不要给她 B 站账号 / 登录 cookie：分享只读公开接口（弹幕、热评、元数据），登录 cookie 由用户自己决定、绝不进脚本参数或聊天。
+- 不要用 `yt-dlp bilisearch:` 搜 B 站（412 风控）；搜索用她的 `web_search` 工具。
+
+---
+
+## 9. 记录新坑的格式
 
 发现新问题时，往对应小节加一行即可，写清四件事：
 

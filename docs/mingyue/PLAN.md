@@ -543,7 +543,8 @@ ntfy App 已经够用。要做成原生通知，得在 `app/android/.../notify/`
 | 1 | App 连上 | 0 | 20 分钟 |
 | **2a** | **人设 + 六层记忆（`mem.py` + `schema.sql`）+ 三个任务**：✅ 已完成上半（后端/连接/备份迁移实测；`init`/`add-episode`/`consolidate`/`search`/`pin`/`render`/`forget`/`report`/`rebuild`/`check` + selftest 13 条手机通过）；✅ 已完成下半（`ingest`/`core-refresh`/`decay`/`import-profile` + schema v2 + persona/rules/me + 三条任务 prompt；selftest 扩到 32 条，手机实测通过） | 一个 Python 文件（约 2000 行）+ SQL schema + prompt 文件 | 1–2 天 |
 | 2b | 内容理解 skill（网页/小说/有字幕视频） | 一个 Python 脚本，约 300–500 行 | 1–2 天 |
-| 2c | ntfy 推送 | 两个 shell 脚本 | 半小时 |
+| **2c** | **主动说话（会话内）**：随机早安 + 主动分享 ✅ 2026-11-17 上线（`ping.py` + 00:05/00:10 两个规划任务，投递到用户会话；机制与验证见 [PROACTIVE.md](PROACTIVE.md)） | `ping.py` + 两个 shell 入口 + 两份行为规范 + `bili-read.sh` | 半天 |
+| 2c·推送 | ntfy 推送（暂缓，先看"会话内主动"够不够） | 两个 shell 脚本 | 半小时 |
 | 3.1 | 改名/图标 | 少量编辑 | 半天 |
 | 3.2 | ~~Chat/Work 模式~~（2026-11-17 删除） | — | 不做 |
 | 3.3 | URL 主机 | 中等 | 2–3 天 |
@@ -608,7 +609,7 @@ ntfy App 已经够用。要做成原生通知，得在 `app/android/.../notify/`
 | B | 阶段 2a：人设 + **六层记忆**（`mem.py` + schema）+ 三个整理任务 | 本文 §6.2–6.4 + [MEMORY.md](MEMORY.md) 全文 |
 | **B2** | **阶段 2a 下半：`ingest` / `core-refresh` / `decay` / `import-profile` + schema v2 + persona/rules/me + 三条任务 prompt**（✅ 代码与手机实测完成；定时任务已挂 每天 04:00 抽取 / 04:10 沉淀 / 周一 04:20 周反思，到点投递已用一次性任务验证，见 `schedules/SETUP.md` 部署记录） | [MEMORY.md](MEMORY.md) §3.1/§3.3/§4.2/§7 + `schedules/SETUP.md` |
 | C | 阶段 2b：内容理解 skill（先网页+小说，再视频） | 本文 §6.5 |
-| **D** | **阶段 2c：主动说话**（随机早安 + 主动找东西分享；ntfy 推送暂缓，先做"会话内主动"） | [HANDOFF-MORNING.md](HANDOFF-MORNING.md) + [HANDOFF-SHARE.md](HANDOFF-SHARE.md) + 本文 §6.6–6.7 |
+| **D** | **阶段 2c：主动说话**（随机早安 + 主动找东西分享；ntfy 推送暂缓，先做"会话内主动"）✅ 2026-11-17 完成：`ping.py` + 两个规划任务（00:05 早安 / 00:10 分享），到点投递进用户会话已实测；见 [PROACTIVE.md](PROACTIVE.md) | [HANDOFF-MORNING.md](HANDOFF-MORNING.md) + [HANDOFF-SHARE.md](HANDOFF-SHARE.md) + 本文 §6.6–6.7 |
 | E | 阶段 3.1：改名与图标 | 本文 §7.1 |
 | F | ~~阶段 3.2：Chat/Work 模式~~（已删除；如果真要做入口，见 §7.6） | 本文 §7.6 |
 | G | 验证 §11.4（PC 当 Work 主机） | 本文 §11.4 |
