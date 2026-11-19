@@ -90,6 +90,7 @@ App 里：主机 → 编辑 → **重启托管的 DSH**（这是文档给的正�
 | **`>` 重定向写坏二进制** | 解出来的包打不开 | 用程序自己的 `-o`（如 `age -d -o`） |
 | **ssh config 用 CRLF** | Git Bash 解析不到 Host | 写成 LF、无 BOM |
 | **`ProxyCommand connect` 不存在** | `Connection closed by UNKNOWN port 65535` | 注释掉，直连或改 `ssh.github.com:443` |
+| **PC 上 Tailscale 掉登录** | `ssh mingyue` 超时（`connect to host 100.x.y.z port 8022: Connection timed out`） | `& "$env:ProgramFiles\Tailscale\tailscale.exe" status` 看 health check；显示 `logged out` 就是 PC 端掉线，重新登录或改用局域网 IP（手机热点网段常见 `192.168.x.x:8022`） |
 
 ---
 

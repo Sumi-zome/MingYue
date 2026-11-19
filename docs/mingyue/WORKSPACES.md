@@ -51,7 +51,8 @@ Chat 里聊的事，溟月第二天会记得；但 Chat 自己**读不到** CORE
 
 ## 记忆权重：日常聊天降一档（2026-11-18 定）
 
-> 口径已定，**代码还没强制**；实现方案（含代码位置、测试、回滚）见 [MEMORY-WEIGHT-PLAN.md](MEMORY-WEIGHT-PLAN.md)。
+> 口径见 [MEMORY-WEIGHT-PLAN.md](MEMORY-WEIGHT-PLAN.md)；2026-11-18 阶段 2f 已实现，
+> 实际行为见下面「实现」小节。
 
 日常聊天里抽出来的记忆，不该和"对方认真说的事"一个分量。
 
@@ -65,10 +66,27 @@ Chat 里聊的事，溟月第二天会记得；但 Chat 自己**读不到** CORE
 - 目的：0.3 左右的条目进不了 CORE「最近」（取 importance 前 8），`decay` 时也会更早归档；她不会拿闲聊里的事反复当谈资。
 - 例外：涉及安全、承诺、时间点（答辩、面试、约定）的，不管在哪个工作区都按 0.6+ 记——权重降的是「闲聊」，不是「事实」。
 
-**为什么现在还没生效**：
+### 实现（2026-11-18，阶段 2f）
 
-`mem.py ingest` 的输出只有 `[会话 <id>]`，抽取模型分不清这段对话来自哪个工作区；`schedules/night-extract.md` 现在仍让模型自己给 0.3–0.9。
-要硬保证，最小改动是：`ingest` 的会话头带上工作区（`[会话 <id> @chat]`），抽取按工作区给默认值；或在 `consolidate` 里按来源会话反查 `cwd` 再 clamp。两处都要动 `mem.py`，本轮只写文档。
+三层都落到了代码里，不再靠提示词自觉：
+
+1. **ingest 标来源**：会话头输出 `[会话 <id> @mingyue]` / `[会话 <id> @chat]`（其它工作区用目录名；会话头缺 `cwd` 时保持 `[会话 <id>]`）。
+2. **抽取给 emphasis**：`schedules/night-extract.md` 要求每条候选带 `emphasis`；默认低，明确强调才 `true` + 0.6–0.9。
+3. **consolidate 硬 clamp**（默认开）：按来源会话反查 `cwd` 得到工作区，未强调的 importance 压到上限，强调的封顶 0.9。
+
+| 来源 | 未强调上限 | 强调上限 |
+|---|---|---|
+| `@mingyue` | 0.40 | 0.90 |
+| `@chat` | 0.35 | 0.90 |
+| 未知 / 其它工作区 | 0.40 | 0.90 |
+
+- 压下来打 `[CLAMP]` 到 stdout；来源会话找不到 / 读不了 → `[WARN]` 并按未知来源，**不中断**整理。
+- 旧候选没有 `emphasis` 字段 → 按未强调压；手动写高权重时 `consolidate` 加 `--no-clamp-daily`。
+- 能解析到 `private` 来源的候选一律拒绝写入（和开关无关）；来源解析不到时按未知来源处理 `0.4`——真正的隐私边界是 `ingest` 的 `exclude`（见下面「配置：抽取范围」）。
+- 只 clamp 当批新候选；合并已有条目仍是 `max()`，已写进去的高权重不会被降。
+- `add-episode` / `import-profile` 不走 consolidate，不受影响（import-profile 仍 0.9）。
+- 测试在 `selftest.py` 的 `test_32`–`test_34`；设计、回滚与实现记录见 [MEMORY-WEIGHT-PLAN.md](MEMORY-WEIGHT-PLAN.md)。
+- 观测：第二天 `core-refresh` 后 CORE「最近」里闲聊类条目应减少；`decay` 会先把 0.3–0.4 的旧闲聊归档。
 
 ## 配置：抽取范围
 

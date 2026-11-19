@@ -31,11 +31,41 @@ if ($Stop) {
   exit 0
 }
 
+# 0. 前置检查：Tailscale 掉线是本脚本最常见的"假装失效"
+Write-Host '[0/3] 检查 Tailscale…'
+$tsExe = 'C:\Program Files\Tailscale\tailscale.exe'
+if (Test-Path $tsExe) {
+  $tsJson = & $tsExe status --json 2>$null
+  if ($tsJson) {
+    try {
+      $ts = $tsJson | ConvertFrom-Json
+      if ($ts.BackendState -ne 'Running' -or -not $ts.Self.Online) {
+        Write-Host "      Tailscale 没连上（BackendState=$($ts.BackendState)）" -ForegroundColor Red
+        if ($ts.Health) { Write-Host "      原因：$($ts.Health -join ' / ')" -ForegroundColor DarkGray }
+        Write-Host ''
+        Write-Host '  处理：' -ForegroundColor Yellow
+        Write-Host '    1) 打开 Tailscale 托盘图标，登录账号；或运行：'
+        Write-Host "       & '$tsExe' login   （会给出一个登录链接）"
+        Write-Host '    2) 登录后重跑本脚本'
+        exit 1
+      }
+      Write-Host '      已连接'
+    } catch {
+      Write-Host '      Tailscale 状态解析失败，继续尝试连接…' -ForegroundColor DarkGray
+    }
+  } else {
+    Write-Host '      读不到 Tailscale 状态（可能没装 CLI），继续尝试…' -ForegroundColor DarkGray
+  }
+} else {
+  Write-Host '      没找到 Tailscale，跳过检查' -ForegroundColor DarkGray
+}
+
 # 1. 读取启动行里的端口与 token
 Write-Host '[1/3] 读取引擎端口与 token…'
 $line = ssh $HostAlias "grep -o 'http://127\.0\.0\.1:[0-9]*/?token=[A-Za-z0-9_-]*' ~/.dsh-app-remote/web.log | tail -1" 2>$null
 if (-not $line) {
-  Write-Host '没读到启动行。可能原因：引擎没在跑（先开 App 连一次），或 ssh 别名不对。' -ForegroundColor Red
+  Write-Host '没读到启动行。可能原因：Tailscale 不通 / 主机没开机 / 引擎没在跑（先开 App 连一次），或 ssh 别名不对。' -ForegroundColor Red
+  Write-Host '先用这条确认主机通不通： ssh mingyue "echo ok"' -ForegroundColor DarkGray
   exit 1
 }
 if ($line -notmatch '127\.0\.0\.1:(\d+)/\?token=([A-Za-z0-9_-]+)') {
