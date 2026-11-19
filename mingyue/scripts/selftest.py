@@ -465,8 +465,8 @@ class MemTest(unittest.TestCase):
         self.assertIsNone(mem.extract_session(header, records[1:], day, "x"))
 
     def test_14_ingest_render_header_line_and_truncation(self):
-        """输出含 [会话 <id>]、[HH:MM] 角色: 文本；超长保头、末尾注明截断。"""
-        session = {"id": "session-abc", "entries": [
+        """输出含 [会话 <id> @来源]、[HH:MM] 角色: 文本；超长保头、末尾注明截断。"""
+        session = {"id": "session-abc", "workspace": None, "entries": [
             (datetime.datetime(2026, 11, 16, 21, 0), "对方", "今天有点累"),
             (datetime.datetime(2026, 11, 16, 21, 1), "溟月", "那就早点睡"),
         ]}
@@ -476,6 +476,9 @@ class MemTest(unittest.TestCase):
         self.assertEqual(lines[0], "[会话 session-abc]")
         self.assertEqual(lines[1], "[21:00] 对方: 今天有点累")
         self.assertEqual(lines[2], "[21:01] 溟月: 那就早点睡")
+        # 会话头带来源标签（工作区目录名），抽取模型据此判断权重
+        tagged = dict(session, workspace=str(self.home / "chat"))
+        self.assertEqual(mem.format_session(tagged)[0], "[会话 session-abc @chat]")
         text, omitted = mem.render_transcript([session], 20)
         self.assertIsNotNone(omitted)
         self.assertGreater(omitted, 0)
@@ -549,7 +552,7 @@ class MemTest(unittest.TestCase):
                            header_extra={"agentPreset": "mingyue-memory"})
 
         proc = self.run_mem("ingest", "--day", "2026-11-16")
-        self.assertIn("[会话 session-good]", proc.stdout)
+        self.assertIn("[会话 session-good @mingyue]", proc.stdout)
         self.assertIn("[09:30] 对方: 昨晚聊了 毕业设计 他说很难", proc.stdout)
         self.assertIn("[09:31] 溟月: 那就慢慢来", proc.stdout)
         self.assertIn("[09:31] 工具: pwsh", proc.stdout)
@@ -596,9 +599,12 @@ class MemTest(unittest.TestCase):
                             self.text_message("user", "user", text))],
                 session_id="session-" + name, cwd=cwd)
         proc = self.run_mem("ingest", "--day", "2026-11-16")
+        self.assertIn("[会话 session-main @mingyue]", proc.stdout)
+        self.assertIn("[会话 session-chat @chat]", proc.stdout)
         self.assertIn("主工作区的话", proc.stdout)
         self.assertIn("正经工作区的话", proc.stdout)
         self.assertNotIn("隐私工作区的话", proc.stdout)
+        self.assertNotIn("session-private", proc.stdout)
         self.assertIn("工作区 1", proc.stderr)
 
     def test_20c_ingest_bad_scopes_is_loud(self):
@@ -701,7 +707,8 @@ class MemTest(unittest.TestCase):
             ("低重要一", 0.10), ("低重要二", 0.05),
         ]
         self.consolidate([{"type": "fact", "text": text, "source_episode": EP,
-                           "importance": importance} for text, importance in facts])
+                           "importance": importance} for text, importance in facts],
+                         extra=("--no-clamp-daily",))
         self.run_mem("pin", "self", "- 你是溟月。话短。", "--reason", "人设")
         self.run_mem("pin", "user", "- 大四。", "--reason", "档案")
         self.run_mem("forget", "f-0009", "--reason", "旧事归档，不该进 auto")
@@ -752,7 +759,7 @@ class MemTest(unittest.TestCase):
                      "--source", "session/x", "--id", EP, "--reason", "测试")
         self.consolidate([{"type": "fact", "text": "要点%d：%s" % (index, "字" * 70),
                            "source_episode": EP, "importance": 0.9 - index * 0.05}
-                          for index in range(4)])
+                          for index in range(4)], extra=("--no-clamp-daily",))
         self.run_mem("pin", "self", "字" * 700, "--reason", "人设")
         self.run_mem("pin", "user", "字" * 300, "--reason", "档案")
         out = self.run_mem("core-refresh")
@@ -779,7 +786,7 @@ class MemTest(unittest.TestCase):
              "importance": 0.9, "when": "2026-09-17"},
             {"type": "fact", "text": "新事实", "source_episode": EP,
              "importance": 0.2, "when": "2026-11-16"},
-        ])
+        ], extra=("--no-clamp-daily",))
         out = self.run_mem("decay")
         self.assertIn("归档 1 条", out.stdout)
         self.assertIn("[ARCHIVE] fact f-0001", out.stdout)
@@ -814,7 +821,7 @@ class MemTest(unittest.TestCase):
              "importance": 0.5, "when": "2026-09-17"},
             {"type": "fact", "text": "会被取代的旧事实", "source_episode": EP,
              "importance": 0.1, "when": "2026-09-17"},
-        ])
+        ], extra=("--no-clamp-daily",))
         # 刷新 f-0001 的 last_used
         self.consolidate([{"type": "fact", "text": "旧但最近用过", "source_episode": EP,
                            "op": "noop", "target": "f-0001", "importance": 0.5}])
@@ -928,6 +935,139 @@ class MemTest(unittest.TestCase):
                 os.environ.pop("MINGYUE_NOW", None)
             else:
                 os.environ["MINGYUE_NOW"] = old_env
+
+    # ── 记忆权重：日常聊天降权（阶段 2f，docs/mingyue/MEMORY-WEIGHT-PLAN.md §5）──
+
+    def test_32_clamp_daily_units(self):
+        """§5.2 clamp 表：未强调按来源上限、强调封顶 0.9、未知 0.4、private 一律拒绝。"""
+        cases = [
+            ("chat", False, 0.8, 0.35),
+            ("mingyue", False, 0.6, 0.4),
+            ("mingyue", True, 0.8, 0.8),
+            ("chat", True, 0.95, 0.9),
+            (None, False, 0.9, 0.4),
+            ("mingyue", True, 0.3, 0.3),      # 强调但本来不高：不升
+        ]
+        for workspace, emphasis, raw, expected in cases:
+            cand = {"importance": raw}
+            if emphasis:
+                cand["emphasis"] = True
+            self.assertAlmostEqual(mem.clamp_daily(cand, workspace), expected,
+                                   msg="workspace=%r emphasis=%r importance=%r" % (
+                                       workspace, emphasis, raw))
+        # 关闭 clamp（手动写入 / --no-clamp-daily）：原样返回
+        self.assertAlmostEqual(mem.clamp_daily({"importance": 0.8}, "chat", False), 0.8)
+        # emphasis 必须是 JSON true；字符串 "true" 不算强调
+        self.assertAlmostEqual(
+            mem.clamp_daily({"importance": 0.9, "emphasis": "true"}, "chat"), 0.35)
+        # private 来源：开不开 clamp 都拒绝（隐私边界不是权重开关）
+        for enabled in (True, False):
+            with self.assertRaises(mem.MemError) as caught:
+                mem.clamp_daily({"importance": 0.5, "emphasis": True}, "private", enabled)
+            self.assertIn("private", str(caught.exception))
+
+    @unittest.skipUnless(ZSTD, "本机没有 zstd：真解压端到端在手机上跑")
+    def test_33_consolidate_clamps_by_source(self):
+        """§5.1/§5.3：ingest 来源标签 + consolidate 按来源（episode/fact）落库时 clamp。"""
+        self.run_mem("init")
+        base = datetime.datetime(2026, 11, 16, 9, 0)
+        dirs = {"mingyue": self.workspace(), "chat": self.home / "chat",
+                "private": self.home / "private", "other-ws": self.home / "other-ws"}
+        session_ids = {}
+        for name, cwd in dirs.items():
+            session_ids[name] = "session-ws-" + name
+            # 真实布局：<会话根>/<工作区目录>/<session-id>/session.v4.jsonl.zstd
+            self.write_session("ws-" + name + "/" + session_ids[name],
+                               [self.event(1, base, "user/message",
+                                           self.text_message("user", "user", name + " 的话"))],
+                               session_id=session_ids[name], cwd=cwd)
+        lines = [
+            {"type": "episode", "id": "e-ws-chat", "kind": "chat", "text": "改 bug 聊了两句",
+             "source": "session:" + session_ids["chat"], "importance": 0.8,
+             "emphasis": False, "reason": "随口提到"},
+            {"type": "fact", "text": "他昨天在改 bug", "source_episode": "e-ws-chat",
+             "importance": 0.8, "emphasis": False, "reason": "随口提到"},
+            {"type": "episode", "id": "e-ws-main", "kind": "chat", "text": "溟月里的闲聊",
+             "source": "session:" + session_ids["mingyue"], "importance": 0.6,
+             "emphasis": False, "reason": "随口说"},
+            {"type": "episode", "id": "e-ws-main-emph", "kind": "chat", "text": "他强调的事",
+             "source": "session:" + session_ids["mingyue"], "importance": 0.95,
+             "emphasis": True, "reason": "他说记住"},
+            {"type": "episode", "id": "e-ws-other", "kind": "chat", "text": "别的工作区",
+             "source": "session:" + session_ids["other-ws"], "importance": 0.8,
+             "emphasis": False, "reason": "随口说"},
+            {"type": "episode", "id": "e-ws-unknown", "kind": "chat", "text": "来源是文件",
+             "source": "file/x", "importance": 0.9, "emphasis": False, "reason": "手写"},
+            {"type": "episode", "id": "e-ws-missing", "kind": "chat", "text": "会话找不到",
+             "source": "session:session-not-exist", "importance": 0.9,
+             "emphasis": False, "reason": "会话已删"},
+        ]
+        proc = self.consolidate(lines)
+        got = {row["id"]: row["importance"]
+               for row in self.rows("SELECT id, importance FROM episodes")}
+        self.assertAlmostEqual(got["e-ws-chat"], 0.35)       # chat 未强调
+        self.assertAlmostEqual(got["e-ws-main"], 0.4)        # mingyue 未强调
+        self.assertAlmostEqual(got["e-ws-main-emph"], 0.9)   # 强调封顶
+        self.assertAlmostEqual(got["e-ws-other"], 0.4)       # 其它工作区按未知
+        self.assertAlmostEqual(got["e-ws-unknown"], 0.4)     # 非 session 来源
+        self.assertAlmostEqual(got["e-ws-missing"], 0.4)     # 会话已删
+        self.assertAlmostEqual(
+            self.one("SELECT importance FROM facts WHERE id='f-0001'"), 0.35,
+            msg="fact 应通过本批已规划的 episode 找到 chat 来源")
+        self.assertIn("[CLAMP]", proc.stdout)
+        self.assertIn("[WARN]", proc.stderr)                 # 未知来源要 loud，不静默
+
+        # 回库反查路径：fact 引用上一批的 episode（不在本批 planned 映射里）
+        self.consolidate([{"type": "fact", "text": "他随口提过的另一件事",
+                           "source_episode": "e-ws-main", "importance": 0.7,
+                           "emphasis": False, "reason": "随口说"}])
+        self.assertAlmostEqual(
+            self.one("SELECT importance FROM facts WHERE text='他随口提过的另一件事'"), 0.4)
+
+        # private 来源：整批拒绝，数据库不动
+        episodes_before = self.one("SELECT COUNT(*) FROM episodes")
+        journal_before = self.one("SELECT COUNT(*) FROM journal")
+        rejected = self.consolidate([
+            {"type": "episode", "id": "e-ws-private", "kind": "chat", "text": "隐私",
+             "source": "session:" + session_ids["private"], "importance": 0.5,
+             "emphasis": True, "reason": "隐私"},
+        ], expect=3)
+        self.assertIn("private", rejected.stderr)
+        self.assertEqual(self.one("SELECT COUNT(*) FROM episodes"), episodes_before)
+        self.assertEqual(self.one("SELECT COUNT(*) FROM journal"), journal_before)
+
+    def test_34_manual_writes_and_no_clamp(self):
+        """§5.4–5.6：add-episode / import-profile 不被 clamp；--no-clamp-daily 保留旧候选；合并取 max。"""
+        self.run_mem("init")
+        # add-episode 内部走 plan_episode，但手动写入必须不 clamp
+        self.run_mem("add-episode", "--kind", "chat", "--text", "手动写的高权重情景",
+                     "--source", "session/x", "--id", EP, "--importance", "0.9",
+                     "--reason", "手写")
+        self.assertAlmostEqual(
+            self.one("SELECT importance FROM episodes WHERE id=?", (EP,)), 0.9)
+        # 默认开：没有 emphasis 字段的旧候选按未强调压到上限
+        self.consolidate([{"type": "fact", "text": "旧候选没有 emphasis",
+                           "source_episode": EP, "importance": 0.8, "reason": "旧候选"}])
+        self.assertAlmostEqual(
+            self.one("SELECT importance FROM facts WHERE text='旧候选没有 emphasis'"), 0.4)
+        # --no-clamp-daily：手动补录保留原值
+        self.consolidate([{"type": "fact", "text": "手动补录的高权重事实",
+                           "source_episode": EP, "importance": 0.8, "reason": "手动"}],
+                         extra=("--no-clamp-daily",))
+        self.assertAlmostEqual(
+            self.one("SELECT importance FROM facts WHERE text='手动补录的高权重事实'"), 0.8)
+        # 合并仍取 max：旧的高权重不会被新候选降下来
+        self.consolidate([{"type": "fact", "text": "手动补录的高权重事实",
+                           "source_episode": EP, "importance": 0.3,
+                           "emphasis": False, "reason": "又提到"}])
+        self.assertAlmostEqual(
+            self.one("SELECT importance FROM facts WHERE text='手动补录的高权重事实'"), 0.8)
+        # import-profile 直写 0.9，不走 consolidate（test_28 已有同断言，这里补齐 §5.6）
+        me = self.home / "me.md"
+        me.write_text("- 手动档案事实\n", encoding="utf-8")
+        self.run_mem("import-profile", me)
+        self.assertAlmostEqual(
+            self.one("SELECT importance FROM facts WHERE text='手动档案事实'"), 0.9)
 
 
 def main():

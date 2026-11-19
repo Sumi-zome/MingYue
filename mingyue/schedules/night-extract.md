@@ -18,9 +18,9 @@
 
    - 宁可少写，不许推测；不确定的不要写。
    - 上限：episode ≤3 条、fact ≤5 条、intention ≤2 条。
-   - importance 给 0.3–0.9（<0.3 的会被衰减掉，别写）。
+   - importance 按下面「权重」一节给；每条都要 `emphasis`（默认 `false`）。
    - 每条都要 `reason`（依据是什么）；fact / intention 必须有 `source_episode`。
-   - `source` 用会话文本里 `[会话 <id>]` 的 id：`"source": "session:<id>"`。
+   - `source` 用会话文本里 `[会话 <id> @<来源>]` 的 id：`"source": "session:<id>"`（不要带 `@` 后缀）。
    - **episode id 必须唯一**：用 `e-YYYYMMDD-HHMM-01` 格式，HHMM 取你这次运行的时间
      （例如 04:12 → `e-20261116-0412-01`）。**不要照抄示例里的固定 id**；
      同一天重跑时把 `-01` 改成 `-02`、`-03`。
@@ -30,10 +30,26 @@
 
 5. 写完只回复一行：`已写入 N 条候选`。不要把会话原文贴出来。
 
+## 权重（2026-11-18 起）
+
+会话头 `[会话 <id> @<来源>]` 里的 `@mingyue` / `@chat` 是这段对话的来源（别的工作区名按来源未知处理）。
+
+- 默认 importance：
+  - `@mingyue` 日常闲聊：0.3–0.4
+  - `@chat` 干活上下文：0.2–0.3
+- 只有下面这些才给 0.6–0.9，并写 `"emphasis": true`：
+  - 对方明确说「记住 / 重要 / 别忘」
+  - 安全、承诺、时间点（答辩 / 面试 / 约定）
+  - `reason` 必须引用能支撑的原话
+- 其余一律 `"emphasis": false`。**每条 episode / fact / intention 都必须带 `emphasis` 字段。**
+- 别想着写高：`consolidate` 会按来源硬压（未强调：mingyue ≤0.4、chat ≤0.35、未知 ≤0.4；
+  强调 ≤0.9），压下来会打 `[CLAMP]` 日志。
+- `source` 保持 `session:<id>` 形式，脚本靠它反查会话头判断来源；写成别的就按未知来源压到 0.4。
+
 ## 格式（严格 JSON Lines）
 
 ```
-{"type":"episode","id":"e-20261116-0412-01","at":"2026-11-16T21:00:00+08:00","kind":"chat","text":"一句话说发生了什么","source":"session:<会话id>","importance":0.6,"reason":"对方明确说了"}
-{"type":"fact","text":"对方宿舍晚上断电","source_episode":"e-20261116-0412-01","when":"2026-11-16","importance":0.6,"reason":"对方明确说了"}
-{"type":"intention","text":"问他毕业设计选了哪个题目","source_episode":"e-20261116-0412-01","due":"2026-11-17","reason":"他说还没定"}
+{"type":"episode","id":"e-20261116-0412-01","at":"2026-11-16T21:00:00+08:00","kind":"chat","text":"对方随口聊到宿舍晚上断电","source":"session:<会话id>","importance":0.3,"emphasis":false,"reason":"对方随口提到"}
+{"type":"fact","text":"对方周五要答辩","source_episode":"e-20261116-0412-01","when":"2026-11-16","importance":0.8,"emphasis":true,"reason":"对方说「记住，周五答辩」"}
+{"type":"intention","text":"周五答辩前一天提醒他","source_episode":"e-20261116-0412-01","due":"2026-11-20","emphasis":false,"reason":"他说还没改完论文"}
 ```

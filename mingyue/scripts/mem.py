@@ -17,6 +17,8 @@
   4. facts 不物理删除：矛盾走 supersede，遗忘走 archived_at。
   5. core 所有块合计 > 1200 字 → pin 报错，不静默截断。
   6. 检索只读：不改 last_used（避免每次检索都写库）。last_used 由 noop / adopt 刷新。
+  7. consolidate 按来源工作区压日常 importance（未强调：mingyue≤0.4 / chat≤0.35 / 未知≤0.4；
+     强调≤0.9）；private 来源一律拒绝，--no-clamp-daily 只关权重、不关拒绝。
 
 时间可注入：$MINGYUE_NOW（ISO8601 或 YYYY-MM-DD）。测试用它固定“现在”。
 
@@ -25,6 +27,7 @@
 
 import argparse
 import datetime
+import glob
 import json
 import math
 import os
@@ -74,6 +77,13 @@ KNOWN_SESSION_VERSIONS = (4,)
 SESSION_FILENAME = "session.v4.jsonl.zstd"
 MEMORY_TASK_PRESETS = ("mingyue-memory",)   # 三条记忆任务的会话预设名（双保险排除）
 INGEST_MAX_CHARS = 60000
+SESSION_SOURCE_PREFIX = "session:"          # 抽取候选的 episode.source 形如 session:<会话id>
+
+# 记忆权重：日常聊天降权（docs/mingyue/MEMORY-WEIGHT-PLAN.md，2026-11-18 定稿）
+# 非强调条目按来源工作区上限；强调条目只封顶；private 来源一律拒绝。以后调参只改这里。
+DAILY_CAPS = {"mingyue": 0.4, "chat": 0.35}
+DAILY_CAP_DEFAULT = 0.4
+EMPHASIS_MAX = 0.9
 
 # schema / 审计版本头（docs/mingyue/MIGRATION.md §8.1）
 SCHEMA_VERSION = 2
@@ -576,6 +586,66 @@ def candidate_reason(cand, default_reason):
     return reason.strip()
 
 
+# ── 记忆权重：日常聊天降权（docs/mingyue/MEMORY-WEIGHT-PLAN.md）──────────────
+
+def clamp_daily(cand, workspace, enabled=True):
+    """按来源工作区把 importance 压到日常上限；private 来源一律拒绝。
+
+    workspace 是来源标签（mingyue / chat / 其它目录名 / None=未知）。
+    enabled=False 只做 private 拒绝与数值校验，不压权重（add-episode 手动写入 / --no-clamp-daily）。
+    emphasis 只有严格的 true 才算「明确强调」：此时不降，但封顶 EMPHASIS_MAX。
+    """
+    value = to_float(cand.get("importance", 0.5), "importance")
+    if workspace == "private":
+        raise MemError("候选来自 private 工作区，拒绝写入（private 不进记忆）")
+    if not enabled:
+        return value
+    if cand.get("emphasis") is True:
+        cap = EMPHASIS_MAX
+    else:
+        cap = DAILY_CAPS.get(workspace, DAILY_CAP_DEFAULT)
+    clamped = min(value, cap)
+    if clamped != value:
+        label = str(cand.get("id") or cand.get("text") or "候选")[:24]
+        print("[CLAMP] %s importance %.2f -> %.2f（来源 %s，%s）" % (
+            label, value, clamped, workspace or "未知",
+            "强调" if cand.get("emphasis") is True else "未强调"))
+    return clamped
+
+
+def candidate_workspace(con, cand, planned_episodes, ws_cache):
+    """候选的来源工作区标签；解析不到 → None（按未知来源 0.40 处理）。
+
+    episode 看 source（session:<id>）；fact / intention 看 source_episode：
+    先查本批已规划的 episode（抽取顺序本来就是先 episode），再回库查 episodes.source。
+    """
+    ctype = cand.get("type")
+    if ctype == "episode":
+        source = cand.get("source")
+        session_id = episode_source_session(source)
+        if session_id is not None:
+            return session_workspace(session_id, ws_cache)
+        if isinstance(source, str) and source.strip():
+            warn("候选来源不是 session:<id>，无法判定工作区，按未知来源处理（上限 %.2f）：%s"
+                 % (DAILY_CAP_DEFAULT, source.strip()))
+        return None
+    source_episode = cand.get("source_episode")
+    if not isinstance(source_episode, str) or not source_episode.strip():
+        return None
+    episode_id = source_episode.strip()
+    if episode_id in planned_episodes:
+        return planned_episodes[episode_id]
+    row = con.execute("SELECT source FROM episodes WHERE id=?", (episode_id,)).fetchone()
+    if row is None:
+        return None       # 出处不存在由 plan_fact / plan_intention 报错，这里不重复喊
+    session_id = episode_source_session(row["source"])
+    if session_id is None:
+        warn("来源 episode %s 的 source 不是 session:<id>（%r），按未知来源处理（上限 %.2f）"
+             % (episode_id, row["source"], DAILY_CAP_DEFAULT))
+        return None
+    return session_workspace(session_id, ws_cache)
+
+
 # ── consolidate：规划（只提案，不落库）与执行 ───────────────────────────────
 
 class Ctx:
@@ -629,14 +699,14 @@ class Ctx:
         return "i-%04d" % self._intention_n
 
 
-def plan_episode(cand, day, default_reason, ctx):
+def plan_episode(cand, day, default_reason, ctx, workspace=None, clamp=True):
     kind = cand.get("kind") or "chat"
     if not isinstance(kind, str) or kind.strip().lower() not in EPISODE_KINDS:
         raise MemError("kind 必须是 chat | reading | event（收到 %r）" % (cand.get("kind"),))
     text = need_str(cand, "text")
     source = need_str(cand, "source")
     at = normalize_at(cand.get("at") or cand.get("when") or day)
-    importance = to_float(cand.get("importance", 0.5), "importance")
+    importance = clamp_daily(cand, workspace, clamp)
     reason = candidate_reason(cand, default_reason)
 
     key = (date_part(at), norm(text), source)
@@ -664,14 +734,14 @@ def plan_episode(cand, day, default_reason, ctx):
             "source": "cli:mem.py consolidate"}
 
 
-def plan_fact(cand, day, default_reason, ctx, lineno):
+def plan_fact(cand, day, default_reason, ctx, lineno, workspace=None, clamp=True):
     text = need_str(cand, "text")
     op = cand.get("op") or "add"
     if not isinstance(op, str) or op.strip().lower() not in FACT_OPS:
         raise MemError("未知 op：%r（只能是 %s）" % (cand.get("op"), " | ".join(FACT_OPS)))
     op = op.strip().lower()
     reason = candidate_reason(cand, default_reason)
-    importance = to_float(cand.get("importance", 0.5), "importance")
+    importance = clamp_daily(cand, workspace, clamp)
     key = norm(text)
 
     if op == "noop":
@@ -766,12 +836,14 @@ def plan_fact(cand, day, default_reason, ctx, lineno):
             "valid_to": date_part(day), "reason": reason, "source": "cli:mem.py consolidate"}
 
 
-def plan_intention(cand, day, default_reason, ctx):
+def plan_intention(cand, day, default_reason, ctx, workspace=None):
     text = need_str(cand, "text")
     source_episode = need_str(cand, "source_episode")
     if source_episode not in ctx.episode_ids and source_episode not in ctx.planned_episode_ids:
         raise MemError("意图没有出处：source_episode=%s 指向的 episode 不存在" % source_episode)
     reason = candidate_reason(cand, default_reason)
+    # 意图没有 importance 列：只走 private 拒绝与数值校验，不压权重（压了也无处存）
+    clamp_daily(cand, workspace, False)
     due = cand.get("due") or cand.get("due_at")
     due_at = normalize_at(due) if due else None
     status = (cand.get("status") or "open")
@@ -938,6 +1010,21 @@ def workspace_of(header):
     return normalize_workspace(cwd)
 
 
+def workspace_label(workspace):
+    """工作区路径 → 来源标签：<家>/mingyue → mingyue、<家>/chat → chat，其它用目录名。"""
+    if not workspace:
+        return None
+    return os.path.basename(os.path.normpath(str(workspace))) or None
+
+
+def episode_source_session(source):
+    """episode.source 形如 session:<id> → 会话 id；其它来源（文件路径 / 手写）→ None。"""
+    if not isinstance(source, str) or not source.startswith(SESSION_SOURCE_PREFIX):
+        return None
+    session_id = source[len(SESSION_SOURCE_PREFIX):].strip()
+    return session_id or None
+
+
 def scopes_path(home):
     return home / SCOPES_NAME
 
@@ -1001,6 +1088,31 @@ def parse_session_header(line, label):
     return header
 
 
+def session_workspace(session_id, cache):
+    """按会话 id 反查会话头里的 cwd → 工作区标签；查不到 / 读不了 → None + WARN。
+
+    只给 consolidate 判来源用：失败不中断整理，按未知来源（默认上限 0.40）处理。
+    """
+    if session_id in cache:
+        return cache[session_id]
+    workspace = None
+    pattern = os.path.join(str(sessions_root()), "*", session_id, SESSION_FILENAME)
+    paths = sorted(glob.glob(pattern))
+    if not paths:
+        warn("找不到来源会话，按未知来源处理（importance 上限 %.2f）：%s"
+             % (DAILY_CAP_DEFAULT, session_id))
+    else:
+        try:
+            lines = read_session_lines(paths[0])
+            header = parse_session_header(lines[0] if lines else "", paths[0])
+        except (MemError, OSError) as exc:
+            warn("读不了来源会话的会话头，按未知来源处理：%s（%s）" % (session_id, exc))
+        else:
+            workspace = workspace_label(workspace_of(header))
+    cache[session_id] = workspace
+    return workspace
+
+
 def message_text(content):
     """把 content parts 里的 text 拼成一行（reasoning / tool-call / image 都不要）。"""
     if not isinstance(content, list):
@@ -1053,11 +1165,15 @@ def extract_session(header, records, day, label):
                 entries.append((when, "工具", name.strip()))
     if human == 0:
         return None
-    return {"id": header["id"], "entries": entries, "human": human}
+    return {"id": header["id"], "entries": entries, "human": human,
+            "workspace": workspace_of(header)}
 
 
 def format_session(session):
-    lines = ["[会话 %s]" % session["id"]]
+    """[会话 <id> @<来源>]：@ 后缀是工作区标签（mingyue / chat / 其它目录名）。"""
+    label = workspace_label(session.get("workspace"))
+    lines = ["[会话 %s @%s]" % (session["id"], label) if label
+             else "[会话 %s]" % session["id"]]
     for when, role, text in session["entries"]:
         lines.append("[%s] %s: %s" % (when.strftime("%H:%M"), role, text))
     return lines
@@ -1150,7 +1266,7 @@ def cmd_add_episode(args):
     cand = {"kind": args.kind, "text": args.text, "source": args.source,
             "importance": args.importance, "at": args.at, "id": args.id,
             "reason": args.reason}
-    item = plan_episode(cand, today().isoformat(), None, ctx)
+    item = plan_episode(cand, today().isoformat(), None, ctx, clamp=False)
     if item["action"] == "skip":
         print("[NOOP] episode 未写入：%s" % item["note"])
         return EXIT_OK
@@ -1168,18 +1284,25 @@ def cmd_consolidate(args):
     cands, errors, label = load_candidates(args.jsonl)
 
     ctx = Ctx(con)
+    ws_cache = {}
+    planned_episode_workspaces = {}
     items = []
     for lineno, cand in cands:
         try:
             ctype = cand.get("type")
+            workspace = candidate_workspace(con, cand, planned_episode_workspaces, ws_cache)
             if ctype == "episode":
-                item = plan_episode(cand, day, args.reason, ctx)
+                item = plan_episode(cand, day, args.reason, ctx,
+                                    workspace=workspace, clamp=args.clamp_daily)
             elif ctype == "fact":
-                item = plan_fact(cand, day, args.reason, ctx, lineno)
+                item = plan_fact(cand, day, args.reason, ctx, lineno,
+                                 workspace=workspace, clamp=args.clamp_daily)
             elif ctype == "intention":
-                item = plan_intention(cand, day, args.reason, ctx)
+                item = plan_intention(cand, day, args.reason, ctx, workspace=workspace)
             else:
                 raise MemError("未知 type：%r（只能是 episode | fact | intention）" % (ctype,))
+            if ctype == "episode" and item["action"] == "add":
+                planned_episode_workspaces[item["row"]["id"]] = workspace
             item["lineno"] = lineno
             items.append(item)
         except MemError as exc:
@@ -2258,6 +2381,8 @@ def build_parser():
     sp.add_argument("--jsonl", required=True, help="候选文件（- 表示 stdin）")
     sp.add_argument("--day", help="默认今天；也接受 today / 今天 / yesterday / 昨天")
     sp.add_argument("--reason", help="整批统一理由（行内 reason 优先）")
+    sp.add_argument("--no-clamp-daily", dest="clamp_daily", action="store_false",
+                    help="不按来源工作区压日常 importance（默认开；手动补录高权重候选用）")
 
     sp = add("ingest", "从磁盘会话文件抽取当天对话（zstd 多帧 → 纯文本）")
     sp.add_argument("--day", help="默认今天；也接受 today / 今天 / yesterday / 昨天")

@@ -182,7 +182,7 @@ CREATE VIRTUAL TABLE mem_fts USING fts5(text, ref UNINDEXED, kind UNINDEXED, tok
 | 过滤 | 头部 `cwd` 规范化后必须在抽取范围里（且不在排除列表）；缺失/不匹配 → 跳过并计数。`agentPreset` 命中记忆任务预设名 → 跳过（双保险）；事件 `time`（毫秒）按**本地日期**过滤 |
 | 取舍 | `user/message` 且 `data.source.kind=="user"`；`assistant/message`；正文取 `content[]` 里 `type=="text"` 的 part（user 在 `data.content`，assistant 在 `data.message.content`）；`tool/call` → 一行，`tool/result` 丢弃；其它事件丢弃 |
 | 防自喂 | 当天没有真人消息（`source.kind=="user"`）的会话整段跳过（定时任务自己的会话就是这样） |
-| 输出 | 每个会话一行 `[会话 <id>]`；消息行 `[HH:MM] 角色: 文本`，角色 ∈ 对方 / 溟月 / 工具；工具行只写工具名（如 `[21:02] 工具: pwsh`），**不输出参数与结果正文**；会话之间空行 |
+| 输出 | 每个会话一行 `[会话 <id> @<来源>]`（来源 = 工作区目录名，如 `mingyue` / `chat`；会话头缺 `cwd` 时只写 `[会话 <id>]`）；消息行 `[HH:MM] 角色: 文本`，角色 ∈ 对方 / 溟月 / 工具；工具行只写工具名（如 `[21:02] 工具: pwsh`），**不输出参数与结果正文**；会话之间空行 |
 | 截断 | 保留开头；超过 `--max-chars` 就停，末尾追加 `[截断] 超过上限 N 字，后面的内容已省略（共省略 M 字）。`；退出码仍 0 |
 | 错误 | 找不到 zstd / 会话根不存在 / 解压失败 / 文件不是 UTF-8 / 会话头坏 / JSON 行坏 / scopes 配置坏 → 各自可读错误 + **退出码 4**，不静默跳过 |
 | 空日 | stdout 空，stderr 报「当天没有可抽取的对话（扫描 N 个会话，工作区 X）」，退出码 0 |
@@ -199,7 +199,7 @@ CREATE VIRTUAL TABLE mem_fts USING fts5(text, ref UNINDEXED, kind UNINDEXED, tok
 - 缺文件 → 只抽 `$HOME/mingyue`（旧行为不变）
 - 配置里的目录不存在 → 告警跳过；全都不存在 → 退出码 4
 - 记忆单向：Chat 的对话进记忆，但 Chat 工作区不注入人设、不读 CORE
-- **记忆权重**：日常聊天（溟月闲聊 / Chat）自动抽出的条目默认 0.3–0.4（Chat 可再低到 0.2–0.3）；对方明确强调的才 0.6–0.9。实现方案见 [MEMORY-WEIGHT-PLAN.md](MEMORY-WEIGHT-PLAN.md)，口径见 [WORKSPACES.md](WORKSPACES.md) §记忆权重
+- **记忆权重**（2026-11-18，阶段 2f 已实现）：`ingest` 会话头标 `@mingyue` / `@chat`；`consolidate` 按来源硬 clamp 未强调候选（mingyue ≤0.4、chat ≤0.35、未知 ≤0.4），`emphasis:true` 才只封顶 0.9，手动高权重用 `--no-clamp-daily`；能解析到 private 来源的候选拒绝写入（硬边界仍是 ingest 的 exclude）。设计见 [MEMORY-WEIGHT-PLAN.md](MEMORY-WEIGHT-PLAN.md)，口径见 [WORKSPACES.md](WORKSPACES.md) §记忆权重
 - 详细设计（含三个边界的实际差别）见 [WORKSPACES.md](WORKSPACES.md)
 
 > 记忆任务预设名暂定 `mingyue-memory`：三条定时任务建会话时用它，`ingest` 按它排除；
@@ -425,7 +425,7 @@ score = 0.45 × 相关性(FTS) + 0.30 × 重要度 + 0.25 × 新鲜度
 |---|---|---|
 | `init` | 建库、建表、建 FTS（幂等；没有 FTS5 时退化并说明） | 已有 |
 | `add-episode --kind --text --source --reason` | 写一条情景，校验必填字段 | 已有 |
-| `consolidate --jsonl FILE [--day D] [--reason R]` | 全量校验 → ADD/UPDATE/SUPERSEDE/NOOP → 落库 → 重建 FTS → 写 journal | 已有 |
+| `consolidate --jsonl FILE [--day D] [--reason R] [--no-clamp-daily]` | 全量校验 → ADD/UPDATE/SUPERSEDE/NOOP → 落库 → 重建 FTS → 写 journal；默认按来源工作区 clamp 日常 importance（§3.1.1），`--no-clamp-daily` 关掉 | 已有 |
 | `search "query" --k 8 [--json] [--include-archived] [--include-superseded] [--adopt ID --reason R]` | 检索，返回带分数的条目 | 已有 |
 | `pin BLOCK "text" --reason R` | 写核心记忆块（所有块合计 ≤1200 字，超了报错不截断） | 已有 |
 | `render [--check]` | 把 core 渲染进 `AGENTS.md` 的 marker 之间（原子写） | 已有 |
@@ -435,7 +435,7 @@ score = 0.45 × 相关性(FTS) + 0.30 × 重要度 + 0.25 × 新鲜度
 | `check` | 自检：表 / FTS trigram / 外键 / core 字数 / 审计文件 | 已有 |
 | `rebuild --from journal.jsonl` | 删库后从审计链重建 | 已有 |
 | `rebuild --check` | 重放校验，输出差异清单 | 已有 |
-| `ingest --day D [--workspace DIR …] [--max-chars N]` | 磁盘会话 → 当天纯文本：`zstd -dc` 解多帧 → cwd/日期过滤（范围来自 `memory-scopes.json`）→ 过滤注入与工具正文 → 输出 `[会话 <id>]` + `[HH:MM] 角色: 文本`，超长截断并注明 | 已有 |
+| `ingest --day D [--workspace DIR …] [--max-chars N]` | 磁盘会话 → 当天纯文本：`zstd -dc` 解多帧 → cwd/日期过滤（范围来自 `memory-scopes.json`）→ 过滤注入与工具正文 → 输出 `[会话 <id> @<来源>]` + `[HH:MM] 角色: 文本`，超长截断并注明 | 已有 |
 | `import-profile me.md` | 把初始档案的列表项灌进 `facts`：先建/复用 `episode e-import-profile`（`kind=event`、`source=me.md`），每条 fact 指向它（importance=0.9、confidence=0.9、`valid_from=今天`）；可重复执行、幂等 | 已有 |
 | `export --md` | 导出 daily/*.md 给人看 | 下一窗口 |
 

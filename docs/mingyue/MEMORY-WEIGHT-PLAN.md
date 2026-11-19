@@ -1,8 +1,27 @@
 # 记忆权重实现方案（日常聊天降权）
 
-> 状态：**方案，未实现**。给另一个窗口实现用。
+> 状态：**已实现**（2026-11-18，阶段 2f）。§0–§6 是定稿设计；实现记录见下面「实现记录」。
 > 需求来源：2026-11-18「有可能会从我日常聊天提取记忆，我希望这部分记忆权重小一点」。
 > 口径文档：[WORKSPACES.md](WORKSPACES.md) §记忆权重。
+
+## 实现记录（2026-11-18，阶段 2f）
+
+- **实际改动行数**（`git diff --numstat`；不含另一任务并发修改的 `docs/mingyue/IMPORT.md`）：
+  - `mingyue/scripts/mem.py` **+136 / −11**：ingest 标 `@来源`、`session_workspace()`、`DAILY_CAPS` / `EMPHASIS_MAX`、`clamp_daily()`、`--no-clamp-daily`、三个 `plan_*` 接来源、`add-episode` 显式 `clamp=False`。
+  - `mingyue/scripts/selftest.py` **+147 / −7**：test_14 / test_19 / test_20b 改期望；test_24–27 显式 `--no-clamp-daily` 保住原数字；新增 test_32–34（§5 全部用例）。
+  - `mingyue/schedules/night-extract.md` **+21 / −5**：权重规则 + `emphasis` 字段 + 示例。
+  - `docs/mingyue/WORKSPACES.md` **+22 / −4**：新增「记忆权重：实现」小节。
+  - `docs/mingyue/MEMORY.md` **+4 / −4**：§3.1.1 一句、§3.1 输出行、§7.2 两条命令。
+- **测试结果**：
+  - 手机 Termux（Python 3.14.10）：`python3 ~/mingyue/scripts/selftest.py` → **38 tests，OK，退出码 0**（zstd 端到端用例真跑）。
+  - PC Windows（Python 3.13.7，本机无 zstd）：`py -3 mingyue/scripts/selftest.py` → **38 tests，OK，4 skipped（zstd 用例），退出码 0**。
+  - 真机验证（不碰真库）：`ingest --day yesterday` → 9 个会话头全 `@mingyue`；`--day today` → 22 个 `@mingyue` + 1 个 `@chat`。临时 home + 两个真实会话 id 跑 `consolidate`：chat 0.80→**0.35**、mingyue 0.60→**0.40**、强调 0.95→**0.90**、未知来源 0.90→**0.40** + `[WARN]`、fact 经本批 episode 0.80→**0.35**；`add-episode` 0.90 原样；`--no-clamp-daily` 0.80 原样；`mem.py check` 真实库全绿（RC=0）。临时库已删。
+- **与设计的有意偏差**：
+  1. `session_workspace()` 复用 `read_session_lines()` 读整个会话文件取头（每天 ≤10 次，够用），没单独实现「只解压第一行」。
+  2. `--no-clamp-daily` 只关权重 clamp；`private` 来源拒绝**不受开关影响**（隐私边界优先于调参）。`plan_intention` 也调 `clamp_daily(..., enabled=False)`：intentions 表没有 importance 列，调用只做 private 拒绝与数值校验（否则会打出无意义的 `[CLAMP]`）。
+  3. 没有实现可选的 `--clamp-daily`：默认就是开，只提供 `--no-clamp-daily`。
+- **独立评审**（2026-11-18，只读）：无高/中严重度问题。4 条低严重度：① intention 的 `importance` 现在也会被校验（intentions 表没有这列；正常抽取给合法数字，记为已知限制）；② 整批被拒时 `[CLAMP]` 已先打到 stdout（诊断信息，库未改）；③ 「private 一律拒绝」措辞过强（已按「能解析到来源时拒绝」修正文档，硬边界仍是 `ingest` 的 `exclude`）；④ 方案里的 `--clamp-daily` 已删（只留 `--no-clamp-daily`）。
+- **部署**：手机备份 `~/mingyue/lab/mem.py.bak-20261118` 与 `night-extract.md.bak-20261118`；三个运行文件已 scp 到 `~/mingyue`（sha256 与仓库一致）。未 commit / 未 push。
 
 ## 0. 一句话
 
@@ -18,7 +37,7 @@
 | clamp 默认 | **开**（手动写入用 `--no-clamp-daily` 关） |
 | 降权范围 | **溟月闲聊 + 聊天都降，聊天更低** |
 
-实现时把这四个值写成常量，以后要调只改常量表。
+实现时把这四个值写成常量（`DAILY_CAPS`、`EMPHASIS_MAX`、argparse 默认值），以后要调只改常量表，不改逻辑。**本方案已定稿，可直接交给实现窗口。**
 
 ## 1. 现状（代码位置，2026-11-18）
 
@@ -70,7 +89,7 @@
 
 ### 2.3 consolidate 硬 clamp（确定性兜底，~40 行）
 
-- 新参数：`--no-clamp-daily`（默认开；`--clamp-daily` 显式开也行）。
+- 新参数：`--no-clamp-daily`（默认开；没有反向的 `--clamp-daily`，默认开就够）。
 - 解析候选前先给每条候选补 `_workspace`：
   - **episode**：`source` 形如 `session:<id>` → 用 `<id>` 查会话头 cwd（见 2.4）。
   - **fact / intention**：按 `source_episode` 找来源：
@@ -99,9 +118,9 @@
 ### 2.4 session id → workspace（~25 行）
 
 ```python
-def session_workspace(home, session_id, cache):
+def session_workspace(session_id, cache):
     if session_id in cache: return cache[session_id]
-    pattern = os.path.join(sessions_root(home), "*", session_id, "session.v4.jsonl.zstd")
+    pattern = os.path.join(str(sessions_root()), "*", session_id, "session.v4.jsonl.zstd")
     paths = glob.glob(pattern)
     if not paths: return cache.setdefault(session_id, None)
     with zstd 解压第一行 → json → header:
@@ -110,6 +129,7 @@ def session_workspace(home, session_id, cache):
     return ws
 ```
 
+- 会话根固定 `~/.dsh/sessions`（`sessions_root()` 本身没有 home 参数；`--home` / `$MINGYUE_HOME` 只管记忆库家目录）。
 - 失败（找不到 / 解压失败 / 头坏）→ `None` + 打一行 `[WARN]`，**不中断** consolidate。
 - 性能：每天候选 ≤10 条，最多读 10 个会话头，可接受。
 
@@ -120,9 +140,9 @@ def session_workspace(home, session_id, cache):
 | `mingyue/scripts/mem.py` | `extract_session` 带 workspace；`format_session` 加 `@label`；`session_workspace()`；`--no-clamp-daily`；三个 `plan_*` 调 `clamp_daily()` |
 | `mingyue/scripts/selftest.py` | 新增单测 + 集成用例（§5） |
 | `mingyue/schedules/night-extract.md` | 权重规则 + `emphasis` 字段 + 示例 |
-| `docs/mingyue/WORKSPACES.md` | 状态从「未强制」改「已实现」，写清实际行为 |
+| `docs/mingyue/WORKSPACES.md` | 新增「记忆权重：实现」一节，写清实际行为（文件里没有旧的状态段可改） |
 | `docs/mingyue/MEMORY.md` | §3.1.1 同步一句 |
-| `mingyue/schedules/night-consolidate.md` | 默认开，可不改；若想显式，加 `--clamp-daily` |
+| `mingyue/schedules/night-consolidate.md` | 默认开，不用改（没有 `--clamp-daily`，只有 `--no-clamp-daily`） |
 
 ## 4. 边界与兼容
 
@@ -133,6 +153,8 @@ def session_workspace(home, session_id, cache):
 - **未知来源**：按 0.4 cap + WARN，不中断。
 - **decay 副作用**：0.35 的条目约 17 天后 strength < 0.2 被归档——这是想要的「日常闲聊会淡掉」；如果不想这么快，调 `DECAY_TAU_DAYS` 或 cap，不要在 clamp 里加特例。
 - **add-episode / import-profile**：不走 consolidate，不受影响（import-profile 仍是 0.9）。
+  **注意**：`add-episode` 内部会调 `plan_episode`，实现时必须显式关掉 clamp（传 `clamp=False`），
+  否则默认开会把手动写入的 importance 压到 0.4；测试必须覆盖这两条不受影响（§5 用例 5/6）。
 
 ## 5. 测试
 
@@ -150,6 +172,9 @@ def session_workspace(home, session_id, cache):
    | private | any | 0.5 | 报错 |
 3. **consolidate 集成**：临时 DB + 合成候选；断言 episode/fact 实际写入的 importance；private 候选被拒；未知来源 0.4。
 4. **合并**：已有 fact 0.7 + 新 chat 候选 0.3 → 仍 0.7。
+5. **add-episode 不受影响**：`add-episode --importance 0.9` → 库里的 importance 必须是 0.9（不被 clamp）。
+6. **import-profile 不受影响**：导入的 facts 仍是 0.9（现有 `test_28` 已断言）；另测旧候选（没有
+   `emphasis` 字段）在默认开下被压到上限、`--no-clamp-daily` 时原样保留。
 
 回归：
 
@@ -176,14 +201,4 @@ MINGYUE_HOME=$(mktemp -d) python3 ~/mingyue/scripts/mem.py init
 - 回滚：恢复 mem.py + night-extract.md；**没有 schema 变更**，已写入的 importance 不回滚（可接受）。
 - 观察点：第二天 `core-refresh` 后 CORE「最近」里闲聊类条目应减少；`decay` 日志里 chat 来源条目会更早出现。
 
-## 7. 已定参数（2026-11-18，用户确认）
-
-| 问题 | 结论 |
-|---|---|
-| 非强调上限 | 聊天 0.35 / 溟月 0.4 |
-| emphasis 上限 | 0.9 |
-| clamp 默认 | 开；手动写入用 `--no-clamp-daily` |
-| 降权范围 | 溟月闲聊 + 聊天都降，聊天更低 |
-
-实现窗口把这四个值写成常量（`DAILY_CAPS`、`EMPHASIS_MAX`、argparse 默认值），
-以后要调只改常量表，不改逻辑。**本方案已定稿，可直接交给实现窗口。**
+（参数表已在 §0.1 定稿，这里不再重复。）
